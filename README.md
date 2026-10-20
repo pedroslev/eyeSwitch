@@ -180,6 +180,16 @@ your gaze, or raise your eyebrows (click where I look).
 The pointer is moved with XTEST on X11, which looks like a real device moving (XWarpPointer does not), and
 with an extra mouse-moved event on macOS, so hover effects follow it.
 
+**Suspend and resume with a gesture.** The *Pause / resume eyeSwitch* action, and the hand option **open palm,
+then close it into a fist**, toggle a **suspended** state, which is not the pause of the hotkey and the
+tray. Pausing lets go of the camera (so nothing could see a gesture to come back); suspended keeps
+watching but acts on nothing: no focus changes, no pointer, no other gestures, no test dot. Only the
+way back is evaluated, and the face model is switched off if that way is the hand. The hotkey and the
+tray always win and clear a suspension. The hand is recognized by MediaPipe's gesture recognizer (an 8 MB
+model, downloaded once); the sequence (a held palm, then a fist within 2 s, then 1.5 s of cool-down) is
+meant to be deliberate, so a hand resting on the keyboard does not trigger it. Show the palm facing the camera
+for half a second, then close the hand; the Gestures screen shows what the camera sees as "Hand now".
+
 Eyebrows up works well. Subtler ones, like biting a lip, depend on your face and may rate as weak.
 Expressions in conversation can trigger gestures by accident: give them a longer hold, or pause
 eyeSwitch with Ctrl+Shift+G during a call. Key and click injection uses XTEST (X11), SendInput
@@ -250,7 +260,7 @@ Where it went, and what was done:
   CPU per 1080p frame, with identical results.
 - **Frames nobody needs are not even decoded.** At rest the tracker drops to 10 fps (`grab` without
   `retrieve`, so the JPEG decode is skipped) and returns to full speed at the first sign of movement:
-  the head moves, the gaze leaves its fixation, a decision or a gesture is pending, a calibration or the
+  the head moves, the gaze leaves the active window (while it wanders inside it nothing can be decided), a decision or a gesture is pending, a calibration or the
   camera view is open, or the test dot is shown. Blinks do not count: they say nothing about where you
   look. Turn **Slow down when nothing is happening** off for the fastest possible first reaction (the
   worst case when starting from rest is one idle frame, 100 ms).
@@ -259,6 +269,11 @@ Where it went, and what was done:
   before the window), idling at 0.2% of a core.
 - **Rewriting in another language would not help**: what is left is decoding the camera's JPEG and
   MediaPipe's models, both native code already. Python's own share is a few percent.
+- **Watching for a hand costs about 8% of a core** (a recognition takes 25 to 31 ms of CPU even with no hand in
+  view, so it runs 3 times a second, and 10 per second only while a palm or a fist is around, which is when a
+  palm-then-fist needs timing). Suspended with no hand around is about 10% of a core. These are component
+  measurements: the engine as a whole could not be re-measured with the hand option because the camera
+  was in use by another program.
 - Tried and discarded: MediaPipe's GPU delegate (not available in this Linux build), and cropping the image
   to the face (saves the same preparation cost, but MediaPipe estimates the head pose assuming the whole
   image, so a moving crop would bias yaw and pitch).

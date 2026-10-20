@@ -15,7 +15,7 @@ import virtualcam
 from backends.base import parse_keys
 from camwatch import CameraWatcher
 from gaze import FixationFilter, GazeModel, OneEuro
-from gestures import Detector, GestureModel
+from gestures import Detector, GestureModel, HandToggle
 from samples import PAD_AFTER, BlinkDetector, clean_capture, clean_indices
 from tracker import Face, HeadTracker
 
@@ -44,6 +44,7 @@ DEFAULTS = {
         "pause_s": 6.0,         # an "overview session" after a key gesture lasts this long (and no automatic focus changes)
         "gaze_cursor": True,    # during that session the mouse pointer follows your gaze (the overview hides any overlay)
         "dwell_ms": 1200,       # ...and looking at one spot this long clicks it (0 = off)
+        "hand_toggle": False,   # an open palm closing into a fist suspends / resumes eyeSwitch (watches for a hand)
         "bindings": [],         # {"label", "action": keys|click|toggle, "keys", "hold_ms", "model"}
     },
 }
@@ -57,9 +58,9 @@ WINDOW_POLL = 0.1       # seconds between "which window is under the gaze" looku
 RETRY = 4.0             # seconds of calm before taking the camera back from another app
 RANGE_LIMIT = 0.5       # pose this far outside the calibrated range (fraction of it): do not act on it
 IDLE_FPS = 10           # tracking rate while nothing is happening
+SUSPENDED_FPS = 3       # while suspended and no hand is around: just often enough to notice one
 CALM_S = 1.5            # seconds without any sign of movement before slowing down
 ACTIVITY_YAW_DEG = 1.5  # the head moved this much off its smoothed yaw: something is happening
-ACTIVITY_SHARE = 0.35   # the estimate is this share of the fixation radius off the held point: so is this
 SESSION_GRACE = 0.6     # seconds after Super before a dwell can click (the overview animates in)
 DWELL_RADIUS = 90       # px: the gaze counts as "one spot" while it stays this close to where the dwell began
 SESSION_MOUSE_PX = 12   # you moved the mouse yourself this much: the session is over, it is yours
@@ -181,7 +182,7 @@ class Camera:
         cfg = self.engine.cfg
         return (cfg["camera"], bool(cfg["virtual_camera"]) and virtualcam.AVAILABLE,
                 self.engine.want_shapes or bool(self.engine.active_gestures()) or cfg["mode"] == "window",
-                cfg["camera_height"], cfg["tracking_fps"])
+                cfg["camera_height"], cfg["tracking_fps"], bool(cfg["gestures"].get("hand_toggle", False)))
 
     def _watch(self, cam):
         path = f"/dev/video{cam}"
@@ -241,7 +242,7 @@ class Camera:
         return self._open(key, now)
 
     def _open(self, key, now):
-        e, (cam, want_vcam, shapes, height, fps) = self.engine, key
+        e, (cam, want_vcam, shapes, height, fps, hands) = self.engine, key
         if self.watcher:
             self.watcher.ignore_for(2.0)                  # the opens below are ours
         sink, e.vcam_state = None, "off"
@@ -256,7 +257,7 @@ class Camera:
                 except Exception as ex:
                     e.vcam_state = f"error: {ex}"
         try:
-            self.tracker, self.key, self.yielded = HeadTracker(cam, sink, shapes, height, fps), key, False
+            self.tracker, self.key, self.yielded = HeadTracker(cam, sink, shapes, height, fps, hands), key, False
             e.active_height = self.tracker.height
             return True
         except Exception as ex:
@@ -303,6 +304,8 @@ class Engine:
         self.tracking_rate = None       # what the engine asked of the tracker last: full speed or IDLE_FPS
         self.session_start = self.session_until = 0.0    # "overview session": pointer follows the gaze until then
         self.in_session = False
+        self.suspended = False          # flag off but still watching: only a toggle gesture / the hand can undo it
+        self.hand_text = ""             # what the hand recognizer sees right now, for the Gestures screen
         self._capture = self._shape_capture = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -391,6 +394,8 @@ class Engine:
                       f"head x{face.tx:+.0f} y{face.ty:+.0f} z{face.tz:+.0f} cm"]
         if self.gaze:
             lines.append(f"gaze {self.gaze[0]:.0f}, {self.gaze[1]:.0f}")
+        if self.suspended:
+            lines.append("SUSPENDED")
         if self.in_session:
             lines.append("OVERVIEW: the pointer follows your gaze")
         if self.blinking:
@@ -443,14 +448,34 @@ class Engine:
                 self._end_session()                                   # picked something: the session is over
                 return 1.0
             if action == "toggle":
-                self.set_enabled(not self.cfg["enabled"])
-                self.gesture_log = f"{label}: toggled eyeSwitch"
+                self._set_suspended(not self.suspended)
         except Exception as e:
             self.gesture_log = f"{label} failed: {e}"
         return 0.0
 
     # --- control -----------------------------------------------------------
+    def _set_suspended(self, value):
+        """Suspend: act on nothing, but keep watching so the same gesture can resume. Not the same as the
+        pause of the hotkey and the tray, which lets go of the camera (nothing could see a gesture then)."""
+        if value == self.suspended:
+            return
+        self.suspended = value
+        self._end_session()
+        if value:
+            self.gaze = self.gaze_live = None
+        self.gesture_log = "Suspended: eyeSwitch acts on nothing until the same gesture" if value else "Resumed"
+        if self.on_change:
+            self.on_change()
+
+    def _resume_hint(self):
+        ways = []
+        if self.cfg["gestures"].get("hand_toggle"):
+            ways.append("open your palm and close it")
+        ways += [f"make the \u201c{b['label']}\u201d gesture" for b in self.active_gestures() if b.get("action") == "toggle"]
+        return "Suspended: " + (" or ".join(ways) if ways else "use the hotkey") + " to resume"
+
     def set_enabled(self, value):
+        self.suspended = False                              # the hotkey and the tray are explicit: they win
         self.cfg["enabled"] = value
         save_config(self.cfg)
         if self.on_change:
@@ -479,6 +504,7 @@ class Engine:
         active_until = time.monotonic() + CALM_S                   # adaptive rate: full speed until then
         suppress_until, gesture_state = 0.0, (-1, [])      # (version, [(binding, model, detector)])
         dwell_anchor, dwell_since = None, 0.0
+        hand_toggle = None
 
         while not self._stop.is_set():
             if hotkey_ok and xs.hotkey_pressed():
@@ -500,9 +526,15 @@ class Engine:
                 active_until = max(active_until, top + CALM_S)          # a decision is pending: stay sharp
             force = (self.calibrating or self.preview_wanted > 0 or self.want_shapes or top < self.session_until
                      or (window_mode_cfg(self) and self.cfg["show_gaze"]))
-            full = (not self.cfg.get("adaptive_rate", True)) or force or top < active_until
+            forced_view = self.calibrating or self.preview_wanted > 0 or self.want_shapes
+            full = (((not self.cfg.get("adaptive_rate", True)) or force or top < active_until)
+                    and not (self.suspended and not forced_view))         # suspended: only watching, at the idle rate
             self.tracking_rate = camera.tracker.max_fps if full else IDLE_FPS
+            if self.suspended and not forced_view and not getattr(camera.tracker, "hand_recent", False):
+                self.tracking_rate = SUSPENDED_FPS                       # nobody is signalling: barely look
             camera.tracker.set_rate(self.tracking_rate)
+            toggles = any(b.get("action") == "toggle" for b in self.active_gestures())
+            camera.tracker.set_face_enabled(not self.suspended or toggles or forced_view)   # no face model if only a hand matters
             try:
                 face, frame = camera.tracker.read()
             except Exception as e:                # show it instead of silently killing the thread
@@ -542,6 +574,18 @@ class Engine:
                     if window_mode:
                         current = wm
 
+            # The hand toggle: an open palm, then a fist.
+            if self.cfg["gestures"].get("hand_toggle", False):
+                hand_toggle = hand_toggle or HandToggle()
+                hand = getattr(camera.tracker, "hand", None)
+                self.hand_text = f"{hand[0]} {hand[1]:.2f}" if hand else "no hand"
+                if getattr(camera.tracker, "hand_recent", False):
+                    active_until = now + CALM_S
+                if hand_toggle.update(hand, now) and not self.calibrating:
+                    self._set_suspended(not self.suspended)
+            else:
+                hand_toggle, self.hand_text = None, ""
+
             if gesture_state[0] != self.gestures_version:          # bindings changed: rebuild detectors
                 gesture_state = (self.gestures_version, [
                     (b, GestureModel.from_dict(b["model"]), Detector(b.get("hold_ms", 250) / 1000))
@@ -555,7 +599,7 @@ class Engine:
                 for _, _, det in detectors:
                     det.update(None, now)
                 cand = None
-                self.status = "No face detected"
+                self.status = self._resume_hint() if self.suspended else "No face detected"
                 continue
             if camera.tracker.shapes:
                 self.shapes_seen = now
@@ -577,7 +621,7 @@ class Engine:
             calibrated = self.calibrated
             click_wanted = any(b.get("action") == "click" for b, _, _ in detectors)
             self.out_of_range = False
-            if (calibrated and self.gaze_model is not None and not self.resolution_mismatch
+            if (calibrated and self.gaze_model is not None and not self.resolution_mismatch and not self.suspended
                     and (window_mode or click_wanted or session)):
                 model, vec = self.gaze_model, np.asarray(face, float)
                 level = min(max(int(self.cfg.get("stability", 3)), 1), 5)
@@ -597,8 +641,6 @@ class Engine:
                 else:
                     raw = model.predict(vec)
                     g, live = gaze_filter.update(raw), live_filter.update(raw, now)
-                    if gaze_filter.pending or math.hypot(raw[0] - g[0], raw[1] - g[1]) > ACTIVITY_SHARE * gaze_filter.radius:
-                        active_until = now + CALM_S
                     self.gaze = clamp_to_monitors(g[0], g[1], monitors)
                     self.gaze_live = clamp_to_monitors(live[0], live[1], monitors)
             else:
@@ -609,7 +651,8 @@ class Engine:
             # Gestures
             shapes = camera.tracker.shapes
             for b, model, det in detectors:
-                score = model.score(shapes) if shapes else None
+                relevant = not self.suspended or b.get("action") == "toggle"     # suspended: only the way back
+                score = model.score(shapes) if (shapes and relevant) else None
                 if score is not None:
                     self.gesture_scores[b["label"]] = score
                     if score > 0.2:
@@ -640,6 +683,9 @@ class Engine:
             else:
                 dwell_anchor = None
 
+            if self.suspended:
+                self.status, cand = self._resume_hint(), None
+                continue
             if not calibrated:
                 self.status = "Not calibrated: click Calibrate"
                 continue
@@ -662,6 +708,15 @@ class Engine:
                     active_bounds = xs.window_bounds(aw) if aw else None
                 wid = win_under if xs.monitor_at(monitors, gx, gy) == mon else None
                 wid = stay_on_active(wid, aw, active_bounds, (gx, gy), edge_margin_px(self.cfg, self.gaze_model))
+                # Nothing can be decided while you look inside the active window, however much your eyes wander
+                # there (reading, typing): full speed is only needed once the gaze leaves it.
+                lx, ly = self.gaze_live or self.gaze
+                margin = edge_margin_px(self.cfg, self.gaze_model)
+                in_active = (active_bounds is not None and
+                             active_bounds[0] - margin <= lx < active_bounds[0] + active_bounds[2] + margin and
+                             active_bounds[1] - margin <= ly < active_bounds[1] + active_bounds[3] + margin)
+                if not in_active or mon != current or (wid and wid != aw):
+                    active_until = now + CALM_S
                 self.status = f"Looking at monitor {mon + 1}"
                 if busy:
                     cand = None

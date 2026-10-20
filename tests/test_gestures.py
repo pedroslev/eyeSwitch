@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from gestures import Detector, GestureModel, train  # noqa: E402
+from gestures import Detector, GestureModel, HandToggle, train  # noqa: E402
 
 NAMES = ["_neutral", "browInnerUp", "browOuterUpLeft", "mouthRollLower", "mouthPressLeft", "jawOpen",
          "eyeBlinkLeft", "mouthSmileLeft"]
@@ -81,6 +81,49 @@ class DetectorTest(unittest.TestCase):
     def test_losing_the_face_resets_the_hold(self):
         det = Detector(hold_s=0.2)
         self.assertEqual(self.feed(det, [1.0, 1.0, 1.0, None, 1.0, 1.0, 1.0]), [])
+
+
+def run_hand(steps, dt=0.05):
+    """steps: [(hand verdict, seconds)] -> times at which HandToggle fired"""
+    det, t, fired = HandToggle(), 0.0, []
+    for hand, seconds in steps:
+        for _ in range(round(seconds / dt)):
+            if det.update(hand, t):
+                fired.append(round(t, 2))
+            t += dt
+    return fired
+
+
+PALM, FIST = ("Open_Palm", 0.95), ("Closed_Fist", 0.95)
+
+
+class HandToggleTest(unittest.TestCase):
+    def test_fires_on_an_open_palm_closing_into_a_fist(self):
+        self.assertEqual(len(run_hand([(None, 0.5), (PALM, 0.4), (FIST, 0.3), (None, 0.5)])), 1)
+
+    def test_a_palm_or_a_fist_alone_never_fires(self):
+        self.assertEqual(run_hand([(PALM, 3.0), (None, 0.5)]), [])
+        self.assertEqual(run_hand([(FIST, 3.0), (None, 0.5)]), [])
+
+    def test_a_flicker_of_a_palm_is_not_enough(self):
+        self.assertEqual(run_hand([(PALM, 0.1), (FIST, 0.5)]), [])
+
+    def test_the_fist_must_follow_soon(self):
+        self.assertEqual(run_hand([(PALM, 0.4), (None, 2.4), (FIST, 0.5)]), [])
+        self.assertEqual(len(run_hand([(PALM, 0.4), (None, 1.0), (FIST, 0.5)])), 1)
+
+    def test_a_doubtful_recognition_is_ignored(self):
+        self.assertEqual(run_hand([(("Open_Palm", 0.4), 0.5), (("Closed_Fist", 0.4), 0.5)]), [])
+
+    def test_closing_the_hand_may_pass_through_other_poses(self):
+        # half-closed fingers read as other canned gestures (or none) for an instant
+        steps = [(PALM, 0.4), (("Pointing_Up", 0.8), 0.15), (None, 0.15), (FIST, 0.3)]
+        self.assertEqual(len(run_hand(steps)), 1)
+
+    def test_it_waits_before_firing_again(self):
+        fired = run_hand([(PALM, 0.4), (FIST, 0.3), (PALM, 0.4), (FIST, 0.3), (None, 0.3),
+                          (None, 1.5), (PALM, 0.4), (FIST, 0.3)])
+        self.assertEqual(len(fired), 2)                        # the second try came too soon, the third did not
 
 
 if __name__ == "__main__":

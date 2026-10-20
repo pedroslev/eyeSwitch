@@ -84,15 +84,17 @@ class FakeSession(BaseSession):
 class FakeTracker:
     face, opens, closes, args = None, 0, 0, None     # args: (camera, has_sink) of the last open
     fail_open, no_frames, shapes_on, shapes = False, False, None, None
+    hands_on, hand_verdict, face_enabled = False, None, True
     frame = np.zeros((48, 64, 3), np.uint8)
 
-    def __init__(self, camera=0, sink=None, blendshapes=False, height="auto", fps=30):
+    def __init__(self, camera=0, sink=None, blendshapes=False, height="auto", fps=30, hands=False):
         if FakeTracker.fail_open:
             raise RuntimeError("device busy")
         FakeTracker.opens += 1
         FakeTracker.args = (camera, sink is not None)
         FakeTracker.height_asked, FakeTracker.fps_asked = height, fps
         self.max_fps, self.camera_fps = fps, 50.0
+        FakeTracker.hands_on, self.recognizer = hands, (object() if hands else None)
         FakeTracker.rate = fps
         self.height = 1080 if height == "auto" else height     # what a 1080p camera would deliver
         FakeTracker.shapes_on = blendshapes
@@ -114,10 +116,22 @@ class FakeTracker:
             return None, None
         if self.sink:
             self.sink("frame")
-        return FakeTracker.face, FakeTracker.frame
+        return (FakeTracker.face if FakeTracker.face_enabled else None), FakeTracker.frame
 
     def set_rate(self, fps):
         FakeTracker.rate = fps
+
+    def set_face_enabled(self, on):
+        FakeTracker.face_enabled = on
+
+    @property
+    def hand(self):
+        return FakeTracker.hand_verdict if FakeTracker.hands_on else None
+
+    @property
+    def hand_recent(self):                                   # like the real one: only a palm or a fist counts
+        return bool(FakeTracker.hands_on and FakeTracker.hand_verdict
+                    and FakeTracker.hand_verdict[0] in ("Open_Palm", "Closed_Fist"))
 
     def raw(self):
         return np.zeros((478, 3), np.float32), np.eye(4, dtype=np.float32), (64, 48), {"eyeLookUpLeft": 0.1}
@@ -191,6 +205,7 @@ class EngineTest(unittest.TestCase):
         FakeTracker.face, FakeTracker.opens, FakeTracker.closes, FakeTracker.args = None, 0, 0, None
         FakeTracker.fail_open = FakeTracker.no_frames = False
         FakeTracker.rate = None
+        FakeTracker.hands_on, FakeTracker.hand_verdict, FakeTracker.face_enabled = False, None, True
         FakeTracker.shapes_on = FakeTracker.shapes = None
         FakeWatcher.instance = FakeVCam.instance = None
         self.engines = []
@@ -292,6 +307,104 @@ class EngineTest(unittest.TestCase):
         e = self.start("window")
         FakeTracker.face = looking_at(-500, 5000)            # the model overshoots wildly
         self.assertTrue(self.wait_for(lambda: e.gaze is not None and e.gaze == (0, 1079)))
+
+    # --- suspend / resume: the flag is off, the program keeps watching ------
+    def with_hand(self, mode="window", *bindings):
+        e = self.start(mode)
+        e.cfg["gestures"] = {"enabled": bool(bindings), "pause_s": 1.0, "bindings": list(bindings), "hand_toggle": True}
+        e.gestures_changed()
+        FakeTracker.face = looking_at(500, 500)
+        self.assertTrue(self.wait_for(lambda: FakeTracker.hands_on))          # the camera reopened with the recognizer
+        time.sleep(0.2)
+        return e
+
+    def show(self, hand, seconds):
+        FakeTracker.hand_verdict = hand
+        time.sleep(seconds)
+
+    def wave(self):                                                            # an open palm, then a fist
+        self.show(("Open_Palm", 0.95), 0.45)
+        self.show(("Closed_Fist", 0.95), 0.35)
+        self.show(None, 0.2)
+
+    def test_the_hand_is_only_watched_when_the_option_is_on(self):
+        self.start("monitor")
+        time.sleep(0.4)
+        self.assertFalse(FakeTracker.hands_on)
+
+    def test_an_open_palm_closing_into_a_fist_suspends_and_the_same_gesture_resumes(self):
+        e = self.with_hand()
+        closes = FakeTracker.closes
+        self.wave()
+        self.assertTrue(e.suspended)
+        self.assertIn("Suspended", e.status)
+        self.assertIn("palm", e.status)
+        self.assertFalse(FakeTracker.face_enabled)                             # no face model while only the hand matters
+        FakeTracker.face = looking_at(1400, 500)                               # would switch to window B...
+        time.sleep(1.0)
+        self.assertEqual(self.os.activated, [])                                # ...but nothing is acted on
+        self.assertEqual(FakeTracker.closes, closes)                           # and the camera was never let go
+        self.wave()                                                            # the same gesture again
+        self.assertFalse(e.suspended)
+        self.assertTrue(FakeTracker.face_enabled)
+        self.assertTrue(self.wait_for(lambda: self.os.activated == [B], 3))
+
+    def test_a_palm_alone_a_fist_alone_or_a_late_fist_do_nothing(self):
+        e = self.with_hand()
+        self.show(("Open_Palm", 0.95), 1.0)                                    # a palm, and nothing follows
+        self.show(None, 2.5)
+        self.show(("Closed_Fist", 0.95), 1.0)                                  # a fist, much too late to count
+        self.show(None, 0.3)
+        self.assertFalse(e.suspended)
+        self.show(("Closed_Fist", 0.95), 1.0)                                  # a fist with no palm before
+        self.show(None, 0.3)
+        self.assertFalse(e.suspended)
+
+    def test_a_face_toggle_gesture_also_suspends_and_resumes_and_blocks_the_others_meanwhile(self):
+        e = self.gestures("monitor", binding("Pause", "toggle", "", 100, "browInnerUp"),
+                          binding("Mouth", "click", "", 100, "jawOpen"))
+        FakeTracker.face = looking_at(500, 500)
+        FakeTracker.shapes = {"browInnerUp": 0.0, "jawOpen": 0.0}
+        time.sleep(0.4)
+        FakeTracker.shapes = {"browInnerUp": 0.7, "jawOpen": 0.0}
+        self.assertTrue(self.wait_for(lambda: e.suspended))
+        self.assertIn("Pause", e.status)                                        # it names the way back
+        self.assertTrue(FakeTracker.face_enabled)                               # a face gesture is the way back
+        FakeTracker.shapes = {"browInnerUp": 0.0, "jawOpen": 0.7}               # another gesture while suspended
+        time.sleep(0.6)
+        self.assertEqual(self.os.clicks, 0)
+        FakeTracker.shapes = {"browInnerUp": 0.0, "jawOpen": 0.0}               # relax, then the same gesture
+        time.sleep(1.0)
+        FakeTracker.shapes = {"browInnerUp": 0.7, "jawOpen": 0.0}
+        self.assertTrue(self.wait_for(lambda: not e.suspended))
+
+    def test_while_suspended_it_barely_looks_unless_a_hand_is_around(self):
+        self.calm_quickly()
+        e = self.with_hand()
+        e._set_suspended(True)
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == engine_mod.SUSPENDED_FPS, 3))
+        FakeTracker.hand_verdict = ("Open_Palm", 0.9)                          # someone is signalling
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == engine_mod.IDLE_FPS, 2))
+        FakeTracker.hand_verdict = None
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == engine_mod.SUSPENDED_FPS, 3))
+        FakeTracker.hand_verdict = ("None", 0.9)                               # a hand resting on the keyboard
+        time.sleep(0.6)
+        self.assertEqual(FakeTracker.rate, engine_mod.SUSPENDED_FPS)           # is not a signal
+
+    def test_the_hotkey_or_the_tray_always_wins_over_a_suspension(self):
+        e = self.start("monitor")
+        e._set_suspended(True)
+        e.set_enabled(False)
+        self.assertFalse(e.suspended)
+        e._set_suspended(True)
+        e.set_enabled(True)
+        self.assertFalse(e.suspended)
+
+    def test_suspending_ends_an_overview_session(self):
+        e = self.start("window")
+        e.in_session, e.session_until = True, time.monotonic() + 30
+        e._set_suspended(True)
+        self.assertFalse(e.in_session)
 
     # --- the overview session: after Super the pointer follows the gaze ----
     def ready_for_super(self, *extra, mode="window", **g):
@@ -646,6 +759,16 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: FakeTracker.rate == engine_mod.IDLE_FPS, 3))
         FakeTracker.face = looking_at(1400, 500)                              # looking elsewhere
         self.assertTrue(self.wait_for(lambda: FakeTracker.rate == 30, 1))
+
+    def test_wandering_inside_the_active_window_keeps_the_tracker_idle(self):
+        self.calm_quickly()
+        self.start("window")
+        FakeTracker.face = looking_at(500, 500)
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == engine_mod.IDLE_FPS, 3))
+        for x, y in ((200, 200), (800, 900), (300, 700), (700, 150)):         # eyes wander about inside window A
+            FakeTracker.face = looking_at(x, y)
+            time.sleep(0.3)
+            self.assertEqual(FakeTracker.rate, engine_mod.IDLE_FPS)
 
     def test_adaptive_rate_can_be_switched_off(self):
         self.calm_quickly()

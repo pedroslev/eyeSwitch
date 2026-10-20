@@ -616,6 +616,16 @@ class GesturesDialog(QDialog):
                                "seen there. The mouse pointer can: it follows your gaze and the system highlights "
                                "what is under it. Needs the full calibration.")
         self.cursor.toggled.connect(self._cursor)
+        self.hand = QCheckBox("Pause / resume eyeSwitch with a hand: open palm, then close it into a fist")
+        self.hand.setChecked(self.g.get("hand_toggle", False))
+        self.hand.setToolTip("Suspended means the flag is off but the camera keeps watching, so the same gesture "
+                             "brings it back; nothing else is acted on meanwhile. It downloads an 8 MB model "
+                             "once and costs about 10% of a CPU core (a recognition is slow, so it looks 3 times a second, "
+                             "10 while a hand is around). Show your palm to the camera for a moment, then close "
+                             "your hand.")
+        self.hand.toggled.connect(self._hand)
+        self.hand_live = QLabel()
+        self.hand_live.setEnabled(False)
         self.dwell = QSpinBox()
         self.dwell.setRange(0, 5000)
         self.dwell.setSingleStep(100)
@@ -645,6 +655,8 @@ class GesturesDialog(QDialog):
         layout.setSpacing(10)
         layout.addWidget(self.enabled)
         layout.addWidget(self.cursor)
+        layout.addWidget(self.hand)
+        layout.addWidget(self.hand_live)
         layout.addLayout(form)
         layout.addLayout(self.rows_box)
         buttons = QHBoxLayout()
@@ -702,6 +714,10 @@ class GesturesDialog(QDialog):
         self.g["enabled"] = on
         self.engine.gestures_changed()
 
+    def _hand(self, on):
+        self.g["hand_toggle"] = on
+        self.engine.gestures_changed()
+
     def _cursor(self, on):
         self.g["gaze_cursor"] = on
         self.engine.gestures_changed()
@@ -720,6 +736,8 @@ class GesturesDialog(QDialog):
             live = self.g["enabled"] and row.binding.get("model") and score is not None
             row.bar.setValue(int(max(0, min(150, score * 100))) if live else 0)
         self.log.setText(self.engine.gesture_log)
+        hand = getattr(self.engine, "hand_text", "")
+        self.hand_live.setText(f"Hand now: {hand}" if self.g.get("hand_toggle") and hand else "")
 
 
 class PreviewWindow(QWidget):
@@ -1079,7 +1097,7 @@ def build_tray(window, engine, cfg, app):
                            and window.show_window())
 
     def sync():
-        on = cfg["enabled"]
+        on = cfg["enabled"] and not engine.suspended
         tray.setIcon(icon("eyeswitch-tray.svg" if on else "eyeswitch-tray-paused.svg"))
         active.blockSignals(True)
         active.setChecked(on)

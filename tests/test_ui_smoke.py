@@ -112,6 +112,18 @@ class GesturesScreenTest(unittest.TestCase):
         dlg.enabled.setChecked(False)
         self.assertFalse(self.cfg["gestures"]["enabled"])
 
+    def test_the_hand_toggle_option_writes_to_the_config_and_shows_the_hand(self):
+        dlg = es.GesturesDialog(None, self.engine, self.cfg)
+        self.assertFalse(dlg.hand.isChecked())
+        dlg.hand.setChecked(True)
+        self.assertTrue(self.cfg["gestures"]["hand_toggle"])
+        self.engine.hand_text = "Open_Palm 0.93"
+        dlg._live()
+        self.assertIn("Open_Palm 0.93", dlg.hand_live.text())
+        dlg.hand.setChecked(False)
+        dlg._live()
+        self.assertEqual(dlg.hand_live.text(), "")
+
     def test_the_overview_controls_write_to_the_config(self):
         dlg = es.GesturesDialog(None, self.engine, self.cfg)                    # the config has none of these keys yet
         self.assertTrue(dlg.cursor.isChecked())

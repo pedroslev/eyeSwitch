@@ -67,10 +67,22 @@ def list_cameras():
     return out
 
 
-def ensure_model():
-    if not os.path.exists(MODEL_PATH):
-        print("Downloading face landmarker model...")
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+HAND_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/gesture_recognizer/"
+                  "gesture_recognizer/float16/1/gesture_recognizer.task")
+HAND_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gesture_recognizer.task")
+# A hand recognition costs ~31 ms of CPU even with no hand in view (the palm detector shrinks its input, so a
+# small picture is as expensive as a large one). So it runs rarely, 3 times a second (~10% of a core), and at
+# 10 per second only while a hand is around, which is when a palm-then-fist needs timing.
+HAND_INTERVAL_IDLE, HAND_INTERVAL_NEAR, HAND_NEAR_S = 0.3, 0.1, 3.0
+HAND_WIDTH = 640
+SIGNAL_POSES = ("Open_Palm", "Closed_Fist")    # only these mean someone is signalling; a hand resting on the
+                                                 # keyboard is "None" and must not speed anything up
+
+
+def ensure_model(path=MODEL_PATH, url=MODEL_URL):
+    if not os.path.exists(path):
+        print(f"Downloading {os.path.basename(path)}...")
+        urllib.request.urlretrieve(url, path)
 
 
 # Tried in this order when the resolution is "auto". Not 4K: the iris landmarks stop improving and the
@@ -79,10 +91,11 @@ SIZES = ((1920, 1080), (1280, 720), (640, 480))
 
 
 class HeadTracker:
-    def __init__(self, camera=0, sink=None, blendshapes=False, height="auto", fps=30):
+    def __init__(self, camera=0, sink=None, blendshapes=False, height="auto", fps=30, hands=False):
         """Opens the camera at the best resolution it really delivers (`height` "auto"), or at 1080/720
         when asked and possible. Tracking runs at `fps` (15 or 30). `sink(frame)` receives every camera
-        frame (for the virtual camera, at 30 fps so calls look good)."""
+        frame (for the virtual camera, at 30 fps so calls look good). With `hands`, the MediaPipe gesture
+        recognizer also watches for a hand (`hand` is its latest verdict)."""
         ensure_model()
         import mediapipe as mp                       # imported here, in the engine thread, so the window
         from mediapipe.tasks import python as mp_python      # appears at once instead of after ~1 s of imports
@@ -106,6 +119,12 @@ class HeadTracker:
         self.landmarks = self.matrix = self.frame_wh = None
         self.blink = None            # mean eyelid closure score 0..1 (needs blendshapes)
         self.landmarker = vision.FaceLandmarker.create_from_options(opts)
+        self.face_enabled, self.hand, self.recognizer, self._last_hand, self._hand_seen = True, None, None, 0.0, -1e9
+        if hands:
+            ensure_model(HAND_MODEL_PATH, HAND_MODEL_URL)
+            self.recognizer = vision.GestureRecognizer.create_from_options(vision.GestureRecognizerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=HAND_MODEL_PATH),
+                running_mode=vision.RunningMode.VIDEO, num_hands=1))
         self.max_fps = self.fps = fps
         self.min_interval = 0.8 / fps                # 0.8: do not skip frames to timing jitter
         self.camera_fps, self._grabbed = 30.0, None     # what the camera really delivers, measured
@@ -125,6 +144,29 @@ class HeadTracker:
                 if got == (w, h):
                     break
         return got
+
+    def set_face_enabled(self, on):
+        """Skip the face model altogether (the engine is suspended and only watches for the hand)."""
+        self.face_enabled = on
+
+    def _read_hand(self, frame, now):
+        """The hand's gesture name and score (Open_Palm, Closed_Fist...), or None when no hand is seen."""
+        self._last_hand = now
+        width = min(HAND_WIDTH, frame.shape[1])
+        small = cv2.resize(frame, (width, int(frame.shape[0] * width / frame.shape[1])), interpolation=cv2.INTER_AREA)
+        mp = self._mp
+        img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+        res = self.recognizer.recognize_for_video(img, int((now - self._t0) * 1000))
+        top = res.gestures[0][0] if res.gestures else None
+        self.hand = (top.category_name, top.score) if top else None
+        if self.hand and self.hand[0] in SIGNAL_POSES and self.hand[1] >= 0.5:
+            self._hand_seen = now
+
+    @property
+    def hand_recent(self):
+        """A palm or a fist was seen in the last few seconds: worth looking more often (the closing of a hand
+        passes through poses that read as "None", which this window of time covers)."""
+        return time.monotonic() - self._hand_seen < HAND_NEAR_S
 
     def set_rate(self, fps):
         """Track at `fps` (never above the rate this tracker was opened with). The camera keeps delivering
@@ -152,6 +194,12 @@ class HeadTracker:
             if due:
                 break
         self._last = now
+        if self.recognizer is not None and now - self._last_hand >= (
+                HAND_INTERVAL_NEAR if now - self._hand_seen < HAND_NEAR_S else HAND_INTERVAL_IDLE):
+            self._read_hand(frame, now)
+        if not self.face_enabled:
+            self.shapes = self.landmarks = self.blink = None
+            return None, frame
         mp = self._mp
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -178,6 +226,8 @@ class HeadTracker:
     def close(self):
         self.cap.release()
         self.landmarker.close()
+        if self.recognizer is not None:
+            self.recognizer.close()
 
 
 def _face(m, lm, w, h):
