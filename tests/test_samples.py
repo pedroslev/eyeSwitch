@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from samples import (MAX_BLINK_FRAMES, PAD_AFTER, PAD_BEFORE, BlinkDetector, clean_capture,  # noqa: E402
+from samples import (PAD_AFTER, PAD_BEFORE, BlinkDetector, clean_capture,  # noqa: E402
                      clean_indices)
 
 
@@ -21,12 +21,29 @@ class BlinkDetectorTest(unittest.TestCase):
 
     def test_a_high_resting_level_is_not_a_blink(self):
         flags = feed([0.2] * 20 + [0.5] * 40)                               # looking down: lids settle lower
-        self.assertLessEqual(sum(flags), MAX_BLINK_FRAMES)
+        self.assertLessEqual(sum(flags), 7)                                 # about MAX_BLINK_S at 15 fps
         self.assertFalse(flags[-1])
 
     def test_blink_frames_do_not_drag_the_baseline_up(self):
         flags = feed([0.3] * 20 + [0.7] * 3 + [0.3] * 20 + [0.7] * 3)
         self.assertEqual(sum(flags), 6)                                     # the second blink is still caught
+
+    def test_a_blink_is_seen_the_same_at_15_and_at_30_fps(self):
+        for fps in (15, 30):
+            d, flags = BlinkDetector(), []
+            n = int(3 * fps)
+            for i in range(n + int(0.3 * fps) + 5):                         # 3 s open, a 0.3 s closure, open
+                closed = n <= i < n + int(0.3 * fps)
+                flags.append(d.update(0.8 if closed else 0.6, i / fps))
+            self.assertEqual(sum(flags), int(0.3 * fps), f"{fps} fps")
+
+    def test_a_long_closure_becomes_the_new_level_at_any_frame_rate(self):
+        for fps in (15, 30):
+            d, flags = BlinkDetector(), []
+            for i in range(int(3 * fps) + int(3 * fps)):                    # lids settle lower for good
+                flags.append(d.update(0.2 if i < 3 * fps else 0.5, i / fps))
+            self.assertFalse(flags[-1])
+            self.assertLessEqual(sum(flags), int(0.4 * fps) + 1)            # at most MAX_BLINK_S, inclusive
 
     def test_missing_scores_are_ignored(self):
         self.assertEqual(feed([None, None, 0.5]), [False, False, False])

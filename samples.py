@@ -11,33 +11,41 @@ from collections import deque
 import numpy as np
 
 BLINK_DELTA = 0.10          # score above the person's own baseline that counts as lids closing
-BASELINE_FRAMES = 45        # about 3 s of history
-MAX_BLINK_FRAMES = 6        # longer than this is a new resting level (looking down), not a blink
+BASELINE_S = 3.0            # how much history the person's own eyelid level is taken from
+MAX_BLINK_S = 0.4           # longer than this is a new resting level (looking down), not a blink
 PAD_BEFORE, PAD_AFTER = 0.10, 0.40      # seconds around a blink that are discarded too (the features
                                         # stay off for ~0.4 s after the lids reopen, measured on real data)
 MAX_HEAD_SPEED = 25.0       # deg/s: faster is a head still travelling between dots, not a fixation
-MIN_BASELINE_FRAMES = 8
+MIN_BASELINE_SAMPLES = 8
+FRAME_S = 1 / 15            # time per frame when the caller gives no timestamps
 
 
 class BlinkDetector:
-    """Is this frame (part of) a blink? Fed one blink score (mean of both eyes) per frame."""
+    """Is this frame (part of) a blink? Fed one blink score (mean of both eyes) per frame, with its time,
+    so it behaves the same at 15 and 30 frames per second."""
 
     def __init__(self):
-        self.history, self.run = deque(maxlen=BASELINE_FRAMES), 0
+        self.history, self.run_start, self._clock = deque(), None, 0.0
 
-    def update(self, score):
+    def update(self, score, t=None):
         if score is None:
             return False
-        if len(self.history) < MIN_BASELINE_FRAMES:
-            self.history.append(score)
+        if t is None:                                  # no timestamps: pretend 15 frames per second
+            self._clock += FRAME_S
+            t = self._clock
+        while self.history and t - self.history[0][0] > BASELINE_S:
+            self.history.popleft()
+        if len(self.history) < MIN_BASELINE_SAMPLES:
+            self.history.append((t, score))
             return False
-        if score - float(np.median(self.history)) > BLINK_DELTA:
-            self.run += 1
-            if self.run <= MAX_BLINK_FRAMES:
-                return True                          # blink frames never move the baseline
+        if score - float(np.median([s for _, s in self.history])) > BLINK_DELTA:
+            if self.run_start is None:
+                self.run_start = t
+            if t - self.run_start <= MAX_BLINK_S:
+                return True                            # blink frames never move the baseline
         else:
-            self.run = 0
-        self.history.append(score)
+            self.run_start = None
+        self.history.append((t, score))
         return False
 
 

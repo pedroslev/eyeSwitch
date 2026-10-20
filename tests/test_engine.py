@@ -85,12 +85,12 @@ class FakeTracker:
     fail_open, no_frames, shapes_on, shapes = False, False, None, None
     frame = np.zeros((48, 64, 3), np.uint8)
 
-    def __init__(self, camera=0, sink=None, blendshapes=False, height="auto"):
+    def __init__(self, camera=0, sink=None, blendshapes=False, height="auto", fps=30):
         if FakeTracker.fail_open:
             raise RuntimeError("device busy")
         FakeTracker.opens += 1
         FakeTracker.args = (camera, sink is not None)
-        FakeTracker.height_asked = height
+        FakeTracker.height_asked, FakeTracker.fps_asked = height, fps
         self.height = 1080 if height == "auto" else height     # what a 1080p camera would deliver
         FakeTracker.shapes_on = blendshapes
         self.sink = sink
@@ -456,6 +456,17 @@ class EngineTest(unittest.TestCase):
         landmarks, matrix, size, shapes = e.last_capture_raw[0]
         self.assertEqual((landmarks.shape, matrix.shape, size, shapes), ((478, 3), (4, 4), (64, 48),
                                                                           {"eyeLookUpLeft": 0.1}))
+
+    def test_the_tracking_rate_setting_reaches_the_tracker_and_defaults_to_30(self):
+        self.start("monitor")
+        self.assertTrue(self.wait_for(lambda: getattr(FakeTracker, "fps_asked", None) == 30))
+        e = self.start("monitor", tracking_fps=15)
+        self.assertTrue(self.wait_for(lambda: FakeTracker.fps_asked == 15))
+
+    def test_the_measured_rate_is_tracked_and_shown(self):
+        e = self.start("monitor")
+        FakeTracker.face = looking_at(500, 500)
+        self.assertTrue(self.wait_for(lambda: e.fps > 30))              # the fake camera runs near 50 per second
 
     def test_a_chosen_resolution_reaches_the_tracker(self):
         e = self.start("window", camera_height=720)

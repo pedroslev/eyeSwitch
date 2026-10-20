@@ -548,6 +548,14 @@ class MainWindow(QWidget):
                                    "its CPU). A gaze calibration only fits the resolution it was made at: "
                                    "calibrate again after changing it.")
         self.resolution.currentIndexChanged.connect(self._on_resolution)
+        self.rate = QComboBox()
+        self.rate.addItem("30 per second: faster and steadier", 30)
+        self.rate.addItem("15 per second: lighter on the CPU", 15)
+        self.rate.setCurrentIndex(max(self.rate.findData(cfg["tracking_fps"]), 0))
+        self.rate.setToolTip("How often the face is tracked. 30 reacts sooner and averages twice the samples "
+                             "for the same wait, for about 60% more CPU (around 11% of a 12-core machine). "
+                             "If the camera cannot deliver 30, it simply runs at what it gives.")
+        self.rate.currentIndexChanged.connect(lambda _: self._set("tracking_fps", self.rate.currentData()))
         self.stability = self._spin(QSpinBox(), 1, 5, 1, "", cfg["stability"], "stability")
         self.stability.setToolTip("How steady the gaze point is: higher holds it still more firmly and "
                                   "follows you a little later. Raise it if focus jumps around.")
@@ -591,6 +599,7 @@ class MainWindow(QWidget):
         self.form = QFormLayout()
         self.form.addRow("Camera", self.camera)
         self.form.addRow("Camera resolution", self.resolution)
+        self.form.addRow("Tracking rate", self.rate)
         self.form.addRow("Mode", self.mode)
         self.form.addRow("Delay before switching monitor", self.delay)
         self.form.addRow("Delay before focusing a window", self.window_delay)

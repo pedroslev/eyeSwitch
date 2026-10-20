@@ -72,26 +72,23 @@ def ensure_model():
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
 
 
-TRACK_FPS = 15          # face tracking rate; the camera may run faster to feed a virtual camera
-
-
 # Tried in this order when the resolution is "auto". Not 4K: the iris landmarks stop improving and the
 # extra pixels only cost CPU. At 640x480 an eye is ~20 px wide, at 1080p ~54 px.
 SIZES = ((1920, 1080), (1280, 720), (640, 480))
 
 
 class HeadTracker:
-    def __init__(self, camera=0, sink=None, blendshapes=False, height="auto"):
+    def __init__(self, camera=0, sink=None, blendshapes=False, height="auto", fps=30):
         """Opens the camera at the best resolution it really delivers (`height` "auto"), or at 1080/720
-        when asked and possible. `sink(frame)` receives every camera frame (for the virtual camera, at
-        30 fps so calls look good) while tracking still runs at TRACK_FPS."""
+        when asked and possible. Tracking runs at `fps` (15 or 30). `sink(frame)` receives every camera
+        frame (for the virtual camera, at 30 fps so calls look good)."""
         ensure_model()
         self.sink = sink
         self.cap = cv2.VideoCapture(camera, _capture_api())
         if not self.cap.isOpened():
             raise RuntimeError(f"cannot open camera {camera}")
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))    # raw formats cannot carry HD over USB
-        self.cap.set(cv2.CAP_PROP_FPS, 30 if sink else TRACK_FPS)
+        self.cap.set(cv2.CAP_PROP_FPS, 30 if (sink or fps >= 30) else 15)
         self.width, self.height = self._pick_size(height)
         opts = vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
@@ -104,7 +101,7 @@ class HeadTracker:
         self.landmarks = self.matrix = self.frame_wh = None
         self.blink = None            # mean eyelid closure score 0..1 (needs blendshapes)
         self.landmarker = vision.FaceLandmarker.create_from_options(opts)
-        self.min_interval = 0.8 / TRACK_FPS          # 0.8: do not skip frames to timing jitter
+        self.min_interval = 0.8 / fps                # 0.8: do not skip frames to timing jitter
         self._last = 0.0
         self._t0 = time.monotonic()
 
@@ -123,7 +120,7 @@ class HeadTracker:
         return got
 
     def read(self):
-        """Return (Face or None, frame) at about TRACK_FPS. Extra frames go to the sink."""
+        """Return (Face or None, frame) at the tracking rate. Extra frames go to the sink."""
         while True:
             ok, frame = self.cap.read()
             if not ok:

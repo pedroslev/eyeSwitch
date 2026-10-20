@@ -34,6 +34,8 @@ DEFAULTS = {
     "calibration_preview": True,  # show the camera view in a corner while calibrating
     "camera_height": "auto",    # "auto" = the camera's best (up to 1080p), or 1080 / 720; a gaze calibration
                                 # only fits the resolution it was made at
+    "tracking_fps": 30,         # 30 or 15: tracking rate (the camera must deliver it); 30 reacts sooner and
+                                # averages twice the samples, for about 60% more CPU than 15
     "stability": 3,             # window mode, 1..5: how steady the gaze point is (higher = steadier, slower)
     "edge_px": 0,               # window mode: stay on the active window within this many px of it (0 = auto)
     "gestures": {               # facial gestures that press keys; bindings come from the Gestures dialog
@@ -58,7 +60,9 @@ RANGE_LIMIT = 0.5       # pose this far outside the calibrated range (fraction o
 _F = Face._fields
 GAZE_COLUMN_SETS = [[_F.index(n) for n in names] for names in (
     ("yaw", "pitch", "h", "v"), ("yaw", "pitch", "h", "v", "nx", "ny"))]
-STABILITY = {1: (2, 0.8), 2: (3, 0.9), 3: (4, 1.0), 4: (5, 1.1), 5: (6, 1.25)}   # level -> (confirm frames, radius x)
+# Steadiness level -> (seconds a new place must hold before the decision point moves, radius factor).
+# In seconds, not frames: the frame rate is a setting. Level 3 is 0.2 s (it was 4 frames = 0.27 s at 15 fps).
+STABILITY = {1: (0.10, 0.8), 2: (0.15, 0.9), 3: (0.20, 1.0), 4: (0.27, 1.1), 5: (0.35, 1.25)}
 
 
 def load_config():
@@ -159,7 +163,7 @@ class Camera:
         cfg = self.engine.cfg
         return (cfg["camera"], bool(cfg["virtual_camera"]) and virtualcam.AVAILABLE,
                 self.engine.want_shapes or bool(self.engine.active_gestures()) or cfg["mode"] == "window",
-                cfg["camera_height"])
+                cfg["camera_height"], cfg["tracking_fps"])
 
     def _watch(self, cam):
         path = f"/dev/video{cam}"
@@ -219,7 +223,7 @@ class Camera:
         return self._open(key, now)
 
     def _open(self, key, now):
-        e, (cam, want_vcam, shapes, height) = self.engine, key
+        e, (cam, want_vcam, shapes, height, fps) = self.engine, key
         if self.watcher:
             self.watcher.ignore_for(2.0)                  # the opens below are ours
         sink, e.vcam_state = None, "off"
@@ -234,7 +238,7 @@ class Camera:
                 except Exception as ex:
                     e.vcam_state = f"error: {ex}"
         try:
-            self.tracker, self.key, self.yielded = HeadTracker(cam, sink, shapes, height), key, False
+            self.tracker, self.key, self.yielded = HeadTracker(cam, sink, shapes, height, fps), key, False
             e.active_height = self.tracker.height
             return True
         except Exception as ex:
@@ -277,6 +281,7 @@ class Engine:
         self.centers, self.calib_monitors, self.gaze_model = None, None, None
         self.calib_height = None        # camera height the gaze model was calibrated at (None: unknown)
         self.active_height = None       # camera height in use right now (None: camera not opened yet)
+        self.fps = 15.0                 # tracking rate measured while running (the filters are tuned in seconds)
         self._capture = self._shape_capture = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -357,7 +362,7 @@ class Engine:
         return samples
 
     def _render_preview(self, tracker, face, frame):
-        lines = [self.status, f"{frame.shape[1]}x{frame.shape[0]}"]
+        lines = [self.status, f"{frame.shape[1]}x{frame.shape[0]}  {self.fps:.0f} fps"]
         if face is not None:
             lines += [f"yaw {face.yaw:+6.1f}   pitch {face.pitch:+6.1f}",
                       f"iris h {face.h:+.3f}   v {face.v:+.3f}   nose {face.nx:+.2f} {face.ny:+.2f}",
@@ -428,7 +433,7 @@ class Engine:
         mouse_time, smooth, cand, cand_since = 0.0, None, None, 0.0
         gaze_filter, filter_key, live_filter = FixationFilter(), None, OneEuro()
         win_checked, win_under, active_bounds = 0.0, None, None
-        blink_detector, blink_until = BlinkDetector(), 0.0
+        blink_detector, blink_until, last_frame_t = BlinkDetector(), 0.0, None
         suppress_until, gesture_state = 0.0, (-1, [])      # (version, [(binding, model, detector)])
 
         while not self._stop.is_set():
@@ -455,6 +460,9 @@ class Engine:
                 camera.fail("Camera error: no frames (is another app using it?)")
                 continue
             now = time.monotonic()
+            if last_frame_t is not None and now - last_frame_t > 0:
+                self.fps += 0.1 * (1.0 / (now - last_frame_t) - self.fps)        # smoothed measured rate
+            last_frame_t = now
             monitors = self.monitors = xs.monitors()
             window_mode = self.window_mode
             if self.preview_wanted > 0:
@@ -495,7 +503,7 @@ class Engine:
                 continue
             if camera.tracker.shapes:
                 self.shapes_seen = now
-            flagged = blink_detector.update(camera.tracker.blink)
+            flagged = blink_detector.update(camera.tracker.blink, now)
             if flagged:
                 blink_until = now + PAD_AFTER          # the lids reopening still distort the estimate
             blinking = self.blinking = now < blink_until
@@ -514,10 +522,12 @@ class Engine:
             if calibrated and self.gaze_model is not None and (window_mode or click_wanted):
                 model, vec = self.gaze_model, np.asarray(face, float)
                 level = min(max(int(self.cfg.get("stability", 3)), 1), 5)
-                if filter_key != (id(model), level):                 # new model or setting: new filter
-                    confirm, factor = STABILITY[level]
+                rate = max(5, round(self.fps / 5) * 5)                 # frames per second, in steps of 5
+                if filter_key != (id(model), level, rate):            # new model, setting or rate: new filter
+                    seconds, factor = STABILITY[level]
                     radius = min(max(2.2 * (model.noise_px or 90.0) * factor, 100.0), 320.0)
-                    gaze_filter, filter_key = FixationFilter(radius, confirm), (id(model), level)
+                    gaze_filter = FixationFilter(radius, max(2, round(seconds * rate)), max(4, round(0.5 * rate)))
+                    filter_key = (id(model), level, rate)
                 if model.range_excess(vec) > RANGE_LIMIT:
                     self.out_of_range, self.gaze, self.gaze_live = True, None, None
                     gaze_filter.update(None)
