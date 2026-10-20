@@ -610,8 +610,24 @@ class GesturesDialog(QDialog):
         self.pause.setSuffix(" s")
         self.pause.setValue(int(self.g.get("pause_s", 6)))
         self.pause.valueChanged.connect(self._pause)
+        self.cursor = QCheckBox("After a key gesture (like Super), the pointer follows my gaze")
+        self.cursor.setChecked(self.g.get("gaze_cursor", True))
+        self.cursor.setToolTip("The overview is drawn by the system above every window, so the test dot cannot be "
+                               "seen there. The mouse pointer can: it follows your gaze and the system highlights "
+                               "what is under it. Needs the full calibration.")
+        self.cursor.toggled.connect(self._cursor)
+        self.dwell = QSpinBox()
+        self.dwell.setRange(0, 5000)
+        self.dwell.setSingleStep(100)
+        self.dwell.setSuffix(" ms")
+        self.dwell.setSpecialValueText("off")
+        self.dwell.setValue(int(self.g.get("dwell_ms", 1200)))
+        self.dwell.setToolTip("During that time, looking at one spot for this long clicks it, so you can pick "
+                              "an app with your eyes alone. Off: use a click gesture instead.")
+        self.dwell.valueChanged.connect(self._dwell)
         form = QFormLayout()
-        form.addRow("After a key gesture, don't switch focus automatically for", self.pause)
+        form.addRow("How long that lasts (no automatic focus changes either)", self.pause)
+        form.addRow("Click after looking at one spot for", self.dwell)
         self.rows_box = QVBoxLayout()
         add = QPushButton("Add gesture")
         add.clicked.connect(self.add)
@@ -621,13 +637,14 @@ class GesturesDialog(QDialog):
         self.log.setEnabled(False)
         hint = QLabel("Train each gesture with your own face: relax, then do it and hold it. Eyebrows up "
                       "works well; subtler ones (biting a lip) may come out as \u201cweak\u201d. "
-                      "Tip: raise your eyebrows for the Windows/Super key, then look at an app and use "
-                      "\u201cClick where I look\u201d on another gesture to pick it.")
+                      "Tip: a gesture that presses Super opens the overview; then the pointer follows your gaze, and "
+                      "you pick an app by looking at it for a moment, or with a \u201cClick where I look\u201d gesture.")
         hint.setWordWrap(True)
         hint.setEnabled(False)
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
         layout.addWidget(self.enabled)
+        layout.addWidget(self.cursor)
         layout.addLayout(form)
         layout.addLayout(self.rows_box)
         buttons = QHBoxLayout()
@@ -683,6 +700,14 @@ class GesturesDialog(QDialog):
 
     def _enabled(self, on):
         self.g["enabled"] = on
+        self.engine.gestures_changed()
+
+    def _cursor(self, on):
+        self.g["gaze_cursor"] = on
+        self.engine.gestures_changed()
+
+    def _dwell(self, value):
+        self.g["dwell_ms"] = value
         self.engine.gestures_changed()
 
     def _pause(self, value):

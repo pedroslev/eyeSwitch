@@ -163,9 +163,22 @@ Per gesture you choose what it does:
 - **Pause / resume eyeSwitch.**
 
 A gesture fires once when held for its hold time (default 250 ms), and again only after the face
-relaxes. After a *key* gesture the automatic focus stays quiet for a few seconds (default 6), so it
-does not fight a menu or an overview you just opened. For example: raise your eyebrows (`super` opens
-the overview), look at an app, bite your lip (click where I look).
+relaxes.
+
+**The overview session.** A gesture that presses keys (say, mouth open for `super`) starts a session of a few
+seconds (default 6). The overview is drawn by the system above every window, so the test dot cannot be seen
+there, and its windows are rearranged into a grid, so "the window under your gaze" is no longer where it
+was on the desktop. What the system does know is where each thumbnail is, and it shows that through the
+**mouse pointer**: so during the session **the pointer follows your gaze** (the system draws it above the
+overview and highlights what is under it), and you pick an app by **looking at one spot for a moment**
+(1.2 s by default, then it clicks) or with a "Click where I look" gesture. The session ends when you pick
+something, when you move the mouse yourself, or when its time runs out; automatic focus changes stay quiet
+meanwhile and resume right after a click. It needs the full calibration; both the pointer and the dwell
+can be turned off in the Gestures screen. For example: open your mouth (`super`), look at an app, hold
+your gaze, or raise your eyebrows (click where I look).
+
+The pointer is moved with XTEST on X11, which looks like a real device moving (XWarpPointer does not), and
+with an extra mouse-moved event on macOS, so hover effects follow it.
 
 Eyebrows up works well. Subtler ones, like biting a lip, depend on your face and may rate as weak.
 Expressions in conversation can trigger gestures by accident: give them a longer hold, or pause

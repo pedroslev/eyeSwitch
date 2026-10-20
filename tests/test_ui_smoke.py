@@ -112,6 +112,17 @@ class GesturesScreenTest(unittest.TestCase):
         dlg.enabled.setChecked(False)
         self.assertFalse(self.cfg["gestures"]["enabled"])
 
+    def test_the_overview_controls_write_to_the_config(self):
+        dlg = es.GesturesDialog(None, self.engine, self.cfg)                    # the config has none of these keys yet
+        self.assertTrue(dlg.cursor.isChecked())
+        self.assertEqual(dlg.dwell.value(), 1200)
+        dlg.cursor.setChecked(False)
+        dlg.dwell.setValue(0)
+        self.assertEqual((self.cfg["gestures"]["gaze_cursor"], self.cfg["gestures"]["dwell_ms"]), (False, 0))
+        dlg.dwell.setValue(1500)
+        self.assertEqual(self.cfg["gestures"]["dwell_ms"], 1500)
+        self.assertGreaterEqual(self.engine.changes, 3)
+
     def test_training_a_gesture_end_to_end(self):
         dlg = es.GesturesDialog(None, self.engine, self.cfg)
         done = []

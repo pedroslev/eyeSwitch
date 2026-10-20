@@ -43,6 +43,9 @@ class Session(BaseSession):
     def warp(self, x, y):
         Quartz.CGWarpMouseCursorPosition(Quartz.CGPointMake(x, y))
         Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+        # A warp alone raises no mouse-moved event, so hover effects (Mission Control) would not follow it.
+        ev = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, (x, y), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
 
     # --- windows -----------------------------------------------------------
     def _windows(self):

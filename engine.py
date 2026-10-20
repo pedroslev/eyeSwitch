@@ -41,7 +41,9 @@ DEFAULTS = {
     "edge_px": 0,               # window mode: stay on the active window within this many px of it (0 = auto)
     "gestures": {               # facial gestures that press keys; bindings come from the Gestures dialog
         "enabled": False,
-        "pause_s": 6.0,         # after a key gesture, no automatic focus changes for this long (menus, overview)
+        "pause_s": 6.0,         # an "overview session" after a key gesture lasts this long (and no automatic focus changes)
+        "gaze_cursor": True,    # during that session the mouse pointer follows your gaze (the overview hides any overlay)
+        "dwell_ms": 1200,       # ...and looking at one spot this long clicks it (0 = off)
         "bindings": [],         # {"label", "action": keys|click|toggle, "keys", "hold_ms", "model"}
     },
 }
@@ -58,6 +60,9 @@ IDLE_FPS = 10           # tracking rate while nothing is happening
 CALM_S = 1.5            # seconds without any sign of movement before slowing down
 ACTIVITY_YAW_DEG = 1.5  # the head moved this much off its smoothed yaw: something is happening
 ACTIVITY_SHARE = 0.35   # the estimate is this share of the fixation radius off the held point: so is this
+SESSION_GRACE = 0.6     # seconds after Super before a dwell can click (the overview animates in)
+DWELL_RADIUS = 90       # px: the gaze counts as "one spot" while it stays this close to where the dwell began
+SESSION_MOUSE_PX = 12   # you moved the mouse yourself this much: the session is over, it is yours
 
 # Candidate feature sets for the gaze model; the one that cross-validates best wins. Head position
 # (tx, ty, tz) is deliberately absent: it says where you sit, not where you look, and a model fitted
@@ -296,6 +301,8 @@ class Engine:
         self.active_height = None       # camera height in use right now (None: camera not opened yet)
         self.fps = 15.0                 # tracking rate measured while running
         self.tracking_rate = None       # what the engine asked of the tracker last: full speed or IDLE_FPS
+        self.session_start = self.session_until = 0.0    # "overview session": pointer follows the gaze until then
+        self.in_session = False
         self._capture = self._shape_capture = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -384,6 +391,8 @@ class Engine:
                       f"head x{face.tx:+.0f} y{face.ty:+.0f} z{face.tz:+.0f} cm"]
         if self.gaze:
             lines.append(f"gaze {self.gaze[0]:.0f}, {self.gaze[1]:.0f}")
+        if self.in_session:
+            lines.append("OVERVIEW: the pointer follows your gaze")
         if self.blinking:
             lines.append("BLINK: estimate held")
         if self.out_of_range:
@@ -400,6 +409,20 @@ class Engine:
         save_config(self.cfg)
         self.gestures_version += 1
 
+    def _start_session(self, seconds):
+        """After a key gesture (Super: the overview), let the pointer follow the gaze for a while: the system
+        draws the pointer above everything and highlights what is under it, so it works where no overlay can."""
+        if (self.cfg["gestures"].get("gaze_cursor", True) and self.gaze_model is not None and self.calibrated
+                and not self.resolution_mismatch):
+            self.session_start = time.monotonic()
+            self.session_until = self.session_start + seconds
+            self.in_session = True
+            return True
+        return False
+
+    def _end_session(self):
+        self.session_until, self.in_session = 0.0, False
+
     def _fire(self, xs, binding):
         """Run a gesture's action; returns seconds during which automatic focus stays quiet."""
         label, action = binding["label"], binding.get("action", "keys")
@@ -408,12 +431,16 @@ class Engine:
                 keys = parse_keys(binding.get("keys", ""))
                 xs.press_keys(keys)
                 self.gesture_log = f"{label}: pressed {'+'.join(keys)}"
-                return float(self.cfg["gestures"].get("pause_s", 6.0))
+                seconds = float(self.cfg["gestures"].get("pause_s", 6.0))
+                if self._start_session(seconds):
+                    self.gesture_log += ": the pointer follows your gaze, look at what you want"
+                return seconds
             if action == "click":
                 if self.gaze:
                     xs.warp(int(self.gaze[0]), int(self.gaze[1]))
                 xs.click()
                 self.gesture_log = f"{label}: clicked" + (" where you look" if self.gaze else "")
+                self._end_session()                                   # picked something: the session is over
                 return 1.0
             if action == "toggle":
                 self.set_enabled(not self.cfg["enabled"])
@@ -451,6 +478,7 @@ class Engine:
         blink_detector, blink_until, last_frame_t = BlinkDetector(), 0.0, None
         active_until = time.monotonic() + CALM_S                   # adaptive rate: full speed until then
         suppress_until, gesture_state = 0.0, (-1, [])      # (version, [(binding, model, detector)])
+        dwell_anchor, dwell_since = None, 0.0
 
         while not self._stop.is_set():
             if hotkey_ok and xs.hotkey_pressed():
@@ -470,7 +498,7 @@ class Engine:
             top = time.monotonic()
             if cand is not None:
                 active_until = max(active_until, top + CALM_S)          # a decision is pending: stay sharp
-            force = (self.calibrating or self.preview_wanted > 0 or self.want_shapes
+            force = (self.calibrating or self.preview_wanted > 0 or self.want_shapes or top < self.session_until
                      or (window_mode_cfg(self) and self.cfg["show_gaze"]))
             full = (not self.cfg.get("adaptive_rate", True)) or force or top < active_until
             self.tracking_rate = camera.tracker.max_fps if full else IDLE_FPS
@@ -494,7 +522,11 @@ class Engine:
 
             # Track the user's own activity so focus can be restored later.
             nx, ny = xs.pointer()
-            if abs(nx - px) + abs(ny - py) > 2:
+            moved = abs(nx - px) + abs(ny - py)
+            if moved > SESSION_MOUSE_PX and now - self.session_start > 0.3:
+                self._end_session()                                   # you took the mouse: it is yours again
+            session = self.in_session = now < self.session_until
+            if moved > 2:
                 mouse_time = now
                 if not window_mode:
                     current = xs.monitor_at(monitors, nx, ny) or current
@@ -545,7 +577,8 @@ class Engine:
             calibrated = self.calibrated
             click_wanted = any(b.get("action") == "click" for b, _, _ in detectors)
             self.out_of_range = False
-            if calibrated and self.gaze_model is not None and (window_mode or click_wanted):
+            if (calibrated and self.gaze_model is not None and not self.resolution_mismatch
+                    and (window_mode or click_wanted or session)):
                 model, vec = self.gaze_model, np.asarray(face, float)
                 level = min(max(int(self.cfg.get("stability", 3)), 1), 5)
                 design = min(camera.tracker.max_fps, camera.tracker.camera_fps)      # what full speed delivers
@@ -582,8 +615,30 @@ class Engine:
                     if score > 0.2:
                         active_until = now + CALM_S                     # a gesture is starting: do not miss its hold
                 if det.update(score, now) and not self.calibrating:
-                    suppress_until = max(suppress_until, now + self._fire(xs, b))
+                    quiet = self._fire(xs, b)
+                    suppress_until = now + quiet if b.get("action") == "click" else max(suppress_until, now + quiet)
                     px, py = xs.pointer()                         # our own warp is not mouse activity
+                    session = now < self.session_until
+
+            # Overview session: the pointer follows the gaze; one spot held long enough is a click.
+            dwell_ms = int(self.cfg["gestures"].get("dwell_ms", 1200))
+            if session and self.gaze_live is not None and not self.calibrating:
+                xs.warp(int(self.gaze_live[0]), int(self.gaze_live[1]))
+                px, py = xs.pointer()
+                if dwell_ms > 0 and self.gaze is not None and now - self.session_start > SESSION_GRACE:
+                    if dwell_anchor is None or math.hypot(self.gaze[0] - dwell_anchor[0],
+                                                          self.gaze[1] - dwell_anchor[1]) > DWELL_RADIUS:
+                        dwell_anchor, dwell_since = self.gaze, now
+                    elif now - dwell_since >= dwell_ms / 1000:
+                        xs.click()
+                        self.gesture_log = f"Looked at one spot for {dwell_ms / 1000:.1f} s: clicked"
+                        self._end_session()
+                        suppress_until, dwell_anchor = now + 1.0, None
+                        px, py = xs.pointer()
+                else:
+                    dwell_anchor = None
+            else:
+                dwell_anchor = None
 
             if not calibrated:
                 self.status = "Not calibrated: click Calibrate"

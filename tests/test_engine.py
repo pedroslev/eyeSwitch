@@ -27,16 +27,17 @@ A, B, C = 1, 2, 3
 class FakeSession(BaseSession):
     def __init__(self):
         self.active, self.activated, self.warps, self.key_age = A, [], [], 99.0
-        self.pressed, self.clicks = [], 0
+        self.pressed, self.clicks, self.ptr = [], 0, (100, 100)
 
     def monitors(self):
         return MONITORS
 
     def pointer(self):
-        return 100, 100
+        return self.ptr
 
     def warp(self, x, y):
         self.warps.append((x, y))
+        self.ptr = (x, y)                                     # the pointer stays where it was put
 
     def active_window(self):
         return self.active
@@ -168,8 +169,9 @@ def identity_model():
 BROWS = GestureModel(["browInnerUp"], [1.0 / 0.7], 0.0, 4.0)    # score 1 when browInnerUp = 0.7
 
 
-def binding(label="Eyebrows", action="keys", keys="super", hold_ms=100):
-    return {"label": label, "action": action, "keys": keys, "hold_ms": hold_ms, "model": BROWS.to_dict()}
+def binding(label="Eyebrows", action="keys", keys="super", hold_ms=100, shape="browInnerUp"):
+    model = GestureModel([shape], [1.0 / 0.7], 0.0, 4.0)        # score 1 when that blendshape is 0.7
+    return {"label": label, "action": action, "keys": keys, "hold_ms": hold_ms, "model": model.to_dict()}
 
 
 class EngineTest(unittest.TestCase):
@@ -291,6 +293,110 @@ class EngineTest(unittest.TestCase):
         FakeTracker.face = looking_at(-500, 5000)            # the model overshoots wildly
         self.assertTrue(self.wait_for(lambda: e.gaze is not None and e.gaze == (0, 1079)))
 
+    # --- the overview session: after Super the pointer follows the gaze ----
+    def ready_for_super(self, *extra, mode="window", **g):
+        e = self.gestures(mode, binding(), *extra, gcfg={"pause_s": 3.0, "dwell_ms": 0, **g})
+        FakeTracker.face = looking_at(1000, 500)
+        FakeTracker.shapes = {"browInnerUp": 0.0, "jawOpen": 0.0}
+        self.assertTrue(self.wait_for(lambda: e.gaze_live is not None and e.gaze is not None))
+        time.sleep(0.2)
+        return e
+
+    def press_super(self):
+        FakeTracker.shapes = {"browInnerUp": 0.7, "jawOpen": 0.0}
+        self.assertTrue(self.wait_for(lambda: self.os.pressed == [["super"]]))
+        FakeTracker.shapes = {"browInnerUp": 0.0, "jawOpen": 0.0}
+
+    def test_after_super_the_pointer_follows_the_gaze(self):
+        e = self.ready_for_super()
+        self.press_super()
+        self.assertTrue(e.in_session)
+        self.assertIn("pointer follows", e.gesture_log)
+        FakeTracker.face = looking_at(2900, 400)                           # looking at an app in the overview
+        self.assertTrue(self.wait_for(
+            lambda: any(abs(x - 2900) < 150 and abs(y - 400) < 150 for x, y in self.os.warps), 4))
+
+    def test_looking_at_one_spot_for_a_while_clicks_it_and_ends_the_session(self):
+        e = self.ready_for_super(dwell_ms=300)
+        self.press_super()
+        FakeTracker.face = looking_at(2900, 400)
+        self.assertTrue(self.wait_for(lambda: self.os.clicks == 1, 5))
+        self.assertIn("Looked at one spot", e.gesture_log)
+        self.assertFalse(e.in_session)                                     # (changes the moment it clicks)
+        warps = len(self.os.warps)
+        time.sleep(0.5)
+        self.assertEqual(len(self.os.warps), warps)                        # the pointer is left alone again
+        self.assertEqual(self.os.clicks, 1)
+
+    def test_a_wandering_gaze_does_not_click(self):
+        e = self.ready_for_super(dwell_ms=500)
+        self.press_super()
+        for x in (2200, 3100, 2300, 3200, 2250, 3150, 2300, 3100):         # never settles for 0.5 s
+            FakeTracker.face = looking_at(x, 400)
+            time.sleep(0.25)
+        self.assertEqual(self.os.clicks, 0)
+
+    def test_the_click_gesture_picks_what_you_look_at_and_automatic_focus_resumes_at_once(self):
+        self.ready_for_super(binding("Mouth", "click", "", 100, "jawOpen"), pause_s=5.0)
+        FakeTracker.face = looking_at(500, 500)
+        self.press_super()
+        FakeTracker.face = looking_at(1400, 500)                           # looking at window B in the overview
+        time.sleep(0.6)
+        self.assertEqual(self.os.activated, [])                            # nothing is switched behind the overview
+        FakeTracker.shapes = {"browInnerUp": 0.0, "jawOpen": 0.7}          # the click gesture
+        self.assertTrue(self.wait_for(lambda: self.os.clicks == 1))
+        self.assertTrue(self.wait_for(lambda: self.os.activated == [B], 3.0))   # 5 s of pause would take longer
+
+    def test_moving_the_mouse_yourself_ends_the_session(self):
+        e = self.ready_for_super()
+        self.press_super()
+        FakeTracker.face = looking_at(2900, 400)
+        self.assertTrue(self.wait_for(lambda: len(self.os.warps) > 3))
+        self.assertTrue(e.in_session)
+        for i in range(40):                                                # you grab the mouse and move it
+            self.os.ptr = (5 + i, 5)
+            time.sleep(0.01)
+        self.assertTrue(self.wait_for(lambda: not e.in_session))
+        warps = len(self.os.warps)
+        time.sleep(0.5)
+        self.assertEqual(len(self.os.warps), warps)
+
+    def test_the_session_expires_by_itself(self):
+        e = self.ready_for_super(pause_s=0.5)
+        self.press_super()
+        self.assertTrue(e.in_session)                                      # it began as soon as Super was pressed
+        self.assertTrue(self.wait_for(lambda: not e.in_session, 3))
+        warps = len(self.os.warps)
+        time.sleep(0.5)
+        self.assertEqual(len(self.os.warps), warps)
+
+    def test_without_a_gaze_model_there_is_no_session(self):
+        e = self.gestures("monitor", binding(), gaze_model=False, gcfg={"pause_s": 3.0})
+        FakeTracker.face = looking_at(500, 500)
+        FakeTracker.shapes = {"browInnerUp": 0.0}
+        time.sleep(0.3)
+        self.press_super()
+        time.sleep(0.4)
+        self.assertFalse(e.in_session)
+        self.assertEqual(self.os.warps, [])
+        self.assertNotIn("pointer follows", e.gesture_log)
+
+    def test_the_gaze_cursor_can_be_turned_off(self):
+        e = self.ready_for_super(gaze_cursor=False)
+        self.press_super()
+        FakeTracker.face = looking_at(2900, 400)
+        time.sleep(0.6)
+        self.assertFalse(e.in_session)
+        self.assertEqual(self.os.warps, [])
+
+    def test_a_click_or_toggle_gesture_alone_does_not_open_a_session(self):
+        e = self.ready_for_super()
+        e.cfg["gestures"]["bindings"] = [binding("Click", "click", "", 100, "browInnerUp")]
+        e.gestures_changed()
+        FakeTracker.shapes = {"browInnerUp": 0.7, "jawOpen": 0.0}
+        self.assertTrue(self.wait_for(lambda: self.os.clicks == 1))
+        self.assertFalse(e.in_session)
+
     # --- blinks, glitches, a pose that left the calibrated range -----------
     def test_a_blink_holds_the_estimate_instead_of_following_it(self):
         e = self.start("window")
@@ -369,9 +475,9 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: FakeTracker.shapes_on))
 
     # --- gestures ----------------------------------------------------------
-    def gestures(self, mode, *bindings, **cfg):
+    def gestures(self, mode, *bindings, gcfg=None, **cfg):
         e = self.start(mode, **cfg)
-        e.cfg["gestures"] = {"enabled": True, "pause_s": 1.0, "bindings": list(bindings)}
+        e.cfg["gestures"] = {"enabled": True, "pause_s": 1.0, "bindings": list(bindings), **(gcfg or {})}
         e.gestures_changed()
         return e
 

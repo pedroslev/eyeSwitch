@@ -34,7 +34,12 @@ class Session(BaseSession):
         return p.root_x, p.root_y
 
     def warp(self, x, y):
-        self.root.warp_pointer(x, y)
+        try:
+            # XTEST motion looks like a real device moving (XI2 RawMotion and Motion); XWarpPointer only yields
+            # Motion, and a shell's overview may not highlight what is under a pointer moved that way.
+            xtest.fake_input(self.d, X.MotionNotify, False, x=int(x), y=int(y))
+        except Exception:
+            self.root.warp_pointer(int(x), int(y))
         self.d.sync()
 
     # --- windows -----------------------------------------------------------
