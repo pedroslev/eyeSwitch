@@ -82,6 +82,7 @@ class FakeSession(BaseSession):
 class FakeTracker:
     face, opens, closes, args = None, 0, 0, None     # args: (camera, has_sink, hires) of the last open
     fail_open, no_frames, shapes_on, shapes = False, False, None, None
+    frame = np.zeros((48, 64, 3), np.uint8)
 
     def __init__(self, camera=0, sink=None, hires=False, blendshapes=False):
         if FakeTracker.fail_open:
@@ -90,6 +91,7 @@ class FakeTracker:
         FakeTracker.args = (camera, sink is not None, hires)
         FakeTracker.shapes_on = blendshapes
         self.sink = sink
+        self.landmarks = None
 
     @property
     def shapes(self):
@@ -101,7 +103,7 @@ class FakeTracker:
             return None, None
         if self.sink:
             self.sink("frame")
-        return FakeTracker.face, "frame"
+        return FakeTracker.face, FakeTracker.frame
 
     def close(self):
         FakeTracker.closes += 1
@@ -353,6 +355,26 @@ class EngineTest(unittest.TestCase):
         samples = e.end_shape_capture()
         self.assertGreater(len(samples), 5)
         self.assertEqual(samples[0], {"browInnerUp": 0.3})
+
+    # --- debug view --------------------------------------------------------
+    def test_preview_is_rendered_only_while_someone_watches(self):
+        e = self.start("monitor")
+        FakeTracker.face = looking_at(500, 500)
+        time.sleep(0.4)
+        self.assertIsNone(e.preview)
+        e.preview_wanted = 1
+        self.assertTrue(self.wait_for(lambda: e.preview is not None))
+        self.assertEqual(e.preview.shape[1], 480)
+        self.assertEqual(e.preview.shape[2], 3)
+
+    def test_preview_wakes_the_camera_even_when_paused(self):
+        e = self.start("monitor", enabled=False)
+        time.sleep(0.3)
+        self.assertEqual(FakeTracker.opens, 0)
+        e.preview_wanted = 1
+        self.assertTrue(self.wait_for(lambda: FakeTracker.opens == 1 and e.preview is not None))
+        e.preview_wanted = 0
+        self.assertTrue(self.wait_for(lambda: FakeTracker.closes == 1))
 
     # --- sharing the camera ------------------------------------------------
     def test_yields_the_camera_when_another_app_opens_it_then_takes_it_back(self):

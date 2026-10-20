@@ -95,6 +95,7 @@ class HeadTracker:
             output_face_blendshapes=blendshapes,
         )
         self.shapes = None           # {blendshape name: 0..1} of the last frame, when enabled
+        self.landmarks = None
         self.landmarker = vision.FaceLandmarker.create_from_options(opts)
         self.min_interval = 0.8 / TRACK_FPS          # 0.8: do not skip frames to timing jitter
         self._last = 0.0
@@ -117,6 +118,7 @@ class HeadTracker:
         res = self.landmarker.detect_for_video(img, int((now - self._t0) * 1000))
         self.shapes = ({c.category_name: c.score for c in res.face_blendshapes[0]}
                        if res.face_blendshapes else None)
+        self.landmarks = res.face_landmarks[0] if res.face_landmarks else None   # for the debug view
         if not res.facial_transformation_matrixes:
             return None, frame
         face = _face(np.array(res.facial_transformation_matrixes[0]),

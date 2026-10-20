@@ -59,9 +59,22 @@ this folder or change Python environments. To run without installing: `python ey
 Window mode estimates where on the desktop you are looking from your head pose and the position
 of your irises. The full calibration fits that model and reports its estimated error (about 5% of a
 monitor width is typical for a webcam), for the centre of the screens and for their edges. It also
-saves `calibration_samples.npz` and `calibration_report.json` next to the settings, so a bad
-calibration can be analyzed. Tick **Show where it thinks I am looking** to see the
-estimate as a red dot while you tune it. In this mode the camera runs at 720p, because at 640x480 an eye is only ~20 px wide. It works best with big windows and a steady seat;
+saves `calibration_samples.npz` and `calibration_report.json` (grid and check errors per point)
+next to the settings, so a bad calibration can be analyzed. Tick **Show where it thinks I am looking** to see the
+estimate as a red dot while you tune it. **Camera view...** opens a live view of what the tracker sees (face mesh, eye corners in green,
+irises in red, yaw/pitch, iris offsets, head position, the gaze estimate), and by default the same view
+appears in the corner of the calibration screens. Use it first when the estimate looks wrong: if the
+irises are not on your irises, or the face keeps getting lost, calibration cannot work.
+
+The full calibration ends with **3 check dots per monitor** at positions it has never seen. The model
+is fitted on the grid only, and the error measured on those dots is the real accuracy (reported as
+good, fair or poor); the saved model then also uses them. Two guards keep a bad frame from throwing the
+estimate across the screen: features that carry no information (the vertical iris offset is mostly
+noise at webcam resolution) are dropped automatically, and live inputs are clamped to the range seen
+while calibrating; a median over the last 5 frames removes one-frame spikes. While you calibrate the
+test dot is hidden, since it would still show the previous calibration.
+
+In this mode the camera runs at 720p, because at 640x480 an eye is only ~20 px wide. It works best with big windows and a steady seat;
 redo the full calibration when you move the camera or change your posture a lot.
 The quick calibration discards a previous gaze model, since both describe the same setup.
 
@@ -133,6 +146,7 @@ cannot use it. What eyeSwitch does about it:
 - `gaze.py`: ridge regression from those features to a desktop point, degree and regularization
   chosen by leave-one-point-out cross-validation (this is also the error estimate); the simplest
   model within 5% of the best wins, since complex ones overshoot at the screen edges.
+- `preview.py`: draws the camera debug view.
 - `gestures.py`: trains a gesture from blendshapes (linear discriminant) and detects it live.
 - `backends/`: one module per OS behind the same interface (`base.py`): monitors, pointer,
   windows (focus, which one is under a point), typing detection, pause hotkey. `x11.py` uses RandR/EWMH, `windows.py` Win32 via ctypes,
@@ -149,7 +163,8 @@ Everything runs locally; frames are never stored.
 python -m unittest discover tests
 ```
 
-They cover the gaze fit, gesture training and detection, the face feature geometry, and the engine
+They cover the gaze fit (including noisy features and spikes), gesture training and detection, the
+full calibration flow offscreen with a simulated camera, the face feature geometry, and the engine
 decisions, including sticky window edges, gestures and camera sharing (fake camera, fake OS backend). Nothing in them touches your camera or your settings.
 
 ## Limits

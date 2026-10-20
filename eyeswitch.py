@@ -34,8 +34,9 @@ def check_linux_qt_deps():
 check_linux_qt_deps()
 
 import numpy as np  # noqa: E402
-from PySide6.QtCore import QObject, QPointF, Qt, QTimer, Signal  # noqa: E402
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPen  # noqa: E402
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal  # noqa: E402
+from PySide6.QtGui import (QAction, QColor, QFont, QGuiApplication, QIcon, QImage, QPainter,  # noqa: E402
+                           QPen, QPixmap)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,  # noqa: E402
                                QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox,
@@ -65,12 +66,18 @@ def screen_for_monitor(i, count):
     return screens[i] if len(screens) == count else QGuiApplication.primaryScreen()
 
 
+def to_qimage(bgr):
+    h, w = bgr.shape[:2]
+    return QImage(bgr.data, w, h, 3 * w, QImage.Format_BGR888).copy()      # copy: detach from the array
+
+
 class CalibrationWindow(QWidget):
     """Fullscreen black window with one dot, shown on a given screen."""
+    PREVIEW_W = 320
 
     def __init__(self, screen, on_cancel):
         super().__init__()
-        self.text, self.on_cancel = "", on_cancel
+        self.text, self.on_cancel, self.preview = "", on_cancel, None
         self.fx, self.fy, self.sampling = 0.5, 0.5, False
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setScreen(screen)
@@ -82,6 +89,10 @@ class CalibrationWindow(QWidget):
 
     def set_dot(self, fx, fy, sampling=False):
         self.fx, self.fy, self.sampling = fx, fy, sampling
+        self.update()
+
+    def set_preview(self, image):
+        self.preview = image
         self.update()
 
     def keyPressEvent(self, event):
@@ -101,14 +112,27 @@ class CalibrationWindow(QWidget):
         p.setFont(QFont(self.font().family(), 24))
         p.drawText(self.rect().adjusted(0, int(self.height() * 0.30), 0, 0), Qt.AlignHCenter | Qt.AlignTop,
                    self.text)
+        if self.preview is not None:              # what the tracker sees, in the bottom-right corner
+            w = self.PREVIEW_W
+            h = w * self.preview.height() / self.preview.width()
+            p.drawImage(QRectF(self.width() - w - 24, self.height() - h - 24, w, h), self.preview)
 
 
 class CalibrationBase:
     def __init__(self, engine, on_done):
         self.engine, self.on_done = engine, on_done
         self.monitors = list(engine.monitors)
-        self.win, self.cancelled = None, False
+        self.win, self.cancelled, self.preview_timer = None, False, None
         engine.calibrating = True
+        if engine.cfg["calibration_preview"]:
+            engine.preview_wanted += 1
+            self.preview_timer = QTimer()
+            self.preview_timer.timeout.connect(self._pump_preview)
+            self.preview_timer.start(70)
+
+    def _pump_preview(self):
+        if self.win is not None and self.engine.preview is not None:
+            self.win.set_preview(to_qimage(self.engine.preview))
 
     def cancel(self):
         self.cancelled = True
@@ -126,6 +150,10 @@ class CalibrationBase:
 
     def _finish(self, ok, message):
         self.engine.calibrating = False
+        if self.preview_timer:
+            self.preview_timer.stop()
+            self.engine.preview_wanted -= 1
+            self.preview_timer = None
         self._close_window()
         self.on_done(ok, message)
 
@@ -178,17 +206,23 @@ class QuickCalibration(CalibrationBase):
 
 
 class FullCalibration(CalibrationBase):
-    """Follow a dot over a 5x3 grid on each monitor with your eyes; fits the gaze model."""
+    """Follow a dot over a 5x3 grid on each monitor with your eyes, then a few check dots.
 
-    SETTLE_MS, SAMPLE_MS, INTRO_MS = 800, 1000, 1800
+    The model is fitted on the grid; the check dots are new positions it has never seen, so the
+    error measured on them is the real accuracy, not a promise. The final model uses all of them.
+    """
+
+    SETTLE_MS, SAMPLE_MS, INTRO_MS, CHECK_MS = 700, 900, 1800, 1200
+    CHECKS = ((0.17, 0.30), (0.62, 0.70), (0.83, 0.30))
 
     def __init__(self, engine, on_done):
         super().__init__(engine, on_done)
-        self.steps = []                              # (monitor, fx, fy), snake order per monitor
+        self.steps = []                              # (monitor, fx, fy, kind), snake order per monitor
         for mon in range(len(self.monitors)):
             for row, fy in enumerate(GRID_Y):
                 for fx in (GRID_X if row % 2 == 0 else GRID_X[::-1]):
-                    self.steps.append((mon, fx, fy))
+                    self.steps.append((mon, fx, fy, "grid"))
+            self.steps += [(mon, fx, fy, "check") for fx, fy in self.CHECKS]
         self.samples, self.i, self.win_mon = [], 0, None
         self._next()
 
@@ -197,13 +231,16 @@ class FullCalibration(CalibrationBase):
             return self._finish(False, "Calibration cancelled.")
         if self.i == len(self.steps):
             return self._solve()
-        mon, fx, fy = self.steps[self.i]
+        mon, fx, fy, kind = self.steps[self.i]
         delay = self.SETTLE_MS
         if mon != self.win_mon:
             self._open_window(mon)
             self.win_mon = mon
             self.win.set_text(f"Monitor {mon + 1} of {len(self.monitors)}: follow the dot with your eyes")
             delay += self.INTRO_MS
+        elif kind == "check" and self.steps[self.i - 1][3] == "grid":
+            self.win.set_text("Now a quick accuracy check: keep following the dot")
+            delay += self.CHECK_MS
         self.win.set_dot(fx, fy)
         QTimer.singleShot(delay, self._begin)
 
@@ -211,7 +248,7 @@ class FullCalibration(CalibrationBase):
         if self.cancelled:
             return self._finish(False, "Calibration cancelled.")
         self.win.set_text("")
-        self.win.set_dot(*self.steps[self.i][1:], sampling=True)
+        self.win.set_dot(*self.steps[self.i][1:3], sampling=True)
         self.engine.begin_capture()
         QTimer.singleShot(self.SAMPLE_MS, self._end)
 
@@ -225,45 +262,69 @@ class FullCalibration(CalibrationBase):
         self.i += 1
         QTimer.singleShot(0, self._next)
 
-    def _solve(self):
-        feats, targets, groups, yaws = [], [], [], []
-        for k, ((mon, fx, fy), faces) in enumerate(zip(self.steps, self.samples)):
+    def _rows(self, picks):
+        feats, targets, groups = [], [], []
+        for k in picks:
+            mon, fx, fy, _ = self.steps[k]
             m = self.monitors[mon]
-            for f in faces:
-                feats.append(np.asarray(f, float))
+            for face in self.samples[k]:
+                feats.append(np.asarray(face, float))
                 targets.append((m.x + fx * m.w, m.y + fy * m.h))
                 groups.append(k)
-            if (fx, fy) == (0.5, 0.5):               # the center dot doubles as the head-yaw calibration
-                yaws.append(statistics.median(f.yaw for f in faces))
+        return np.array(feats), np.array(targets), np.array(groups)
+
+    def _solve(self):
+        grid = [k for k, st in enumerate(self.steps) if st[3] == "grid"]
+        check = [k for k, st in enumerate(self.steps) if st[3] == "check"]
+        yaws = [statistics.median(f.yaw for f in self.samples[k])        # the centre dot doubles as the
+                for k in grid if self.steps[k][1:3] == (0.5, 0.5)]       # head-yaw calibration
         if not self._check_spacing(yaws):
             return
-        model = gaze.fit(np.array(feats), np.array(targets), np.array(groups))
-        self.engine.set_calibration(yaws, self.monitors, model)
-        width = statistics.mean(m.w for m in self.monitors)
 
+        held_out = gaze.fit(*self._rows(grid))
+        check_errors = []
+        for k in check:
+            feats, targets, _ = self._rows([k])
+            guess = np.median([held_out.predict(f) for f in feats], axis=0)
+            check_errors.append(float(np.hypot(*(guess - targets[0]))))
+        model = gaze.fit(*self._rows(grid + check))
+        self.engine.set_calibration(yaws, self.monitors, model)
+
+        width = statistics.mean(m.w for m in self.monitors)
         edge, inner, report = [], [], []
-        for k, (mon, fx, fy) in enumerate(self.steps):
+        for k, (mon, fx, fy, kind) in enumerate(self.steps):
             err = model.point_errors.get(k)
             on_edge = fx in (GRID_X[0], GRID_X[-1]) or fy in (GRID_Y[0], GRID_Y[-1])
-            if err is not None:
+            if err is not None and kind == "grid":
                 (edge if on_edge else inner).append(err)
-            report.append({"monitor": mon + 1, "x": fx, "y": fy, "error_px": err,
+            report.append({"monitor": mon + 1, "x": fx, "y": fy, "kind": kind, "error_px": err,
                            "samples": len(self.samples[k]), "edge": on_edge})
+        mean_check, worst_check = statistics.mean(check_errors), max(check_errors)
         try:                      # kept so a bad calibration can be analyzed offline
+            feats, targets, groups = self._rows(range(len(self.steps)))
             os.makedirs(CONFIG_DIR, exist_ok=True)
-            np.savez_compressed(os.path.join(CONFIG_DIR, "calibration_samples.npz"),
-                                features=np.array(feats), targets=np.array(targets),
-                                groups=np.array(groups), steps=np.array(self.steps))
+            np.savez_compressed(os.path.join(CONFIG_DIR, "calibration_samples.npz"), features=feats,
+                                targets=targets, groups=groups,
+                                steps=np.array([(m, x, y, 0 if kd == "grid" else 1) for m, x, y, kd in self.steps]))
             with open(os.path.join(CONFIG_DIR, "calibration_report.json"), "w") as f:
-                json.dump({"degree": model.degree, "error_px": model.error_px, "points": report}, f, indent=2)
+                json.dump({"degree": model.degree, "features": model.active, "error_px": model.error_px,
+                           "check_mean_px": mean_check, "check_worst_px": worst_check, "points": report},
+                          f, indent=2)
         except OSError:
             pass
-        detail = ""
+
+        share = mean_check / width
+        verdict = "good" if share < 0.08 else "fair" if share < 0.14 else "poor"
+        message = (f"Calibration saved.\nCheck on {len(check)} new dots: average error {mean_check:.0f} px "
+                   f"({100 * share:.0f}% of a monitor width), worst {worst_check:.0f} px: {verdict}.")
         if edge and inner:
-            detail = (f"\nCenter of the screens: ~{statistics.mean(inner):.0f} px, "
-                      f"edges: ~{statistics.mean(edge):.0f} px.")
-        self._finish(True, f"Calibration saved.\nEstimated gaze error: about {model.error_px:.0f} px "
-                           f"({100 * model.error_px / width:.0f}% of a monitor width).{detail}")
+            message += (f"\nGrid points, centre ~{statistics.mean(inner):.0f} px, "
+                        f"edges ~{statistics.mean(edge):.0f} px.")
+        if verdict == "poor":
+            message += ("\n\nThat is not good enough for window mode. Sit as you normally do, keep the camera "
+                        "still and follow each dot with your head and eyes, then calibrate again. The camera "
+                        "preview shows whether your face and irises are being detected.")
+        self._finish(True, message)
 
 
 class GazeDot(QWidget):
@@ -536,6 +597,42 @@ class GesturesDialog(QDialog):
         self.log.setText(self.engine.gesture_log)
 
 
+class PreviewWindow(QWidget):
+    """Live camera view with the face mesh, irises and the numbers the model gets."""
+
+    def __init__(self, engine):
+        super().__init__()
+        self.engine, self.counted = engine, False
+        self.setWindowTitle("eyeSwitch camera")
+        self.setWindowFlag(Qt.WindowStaysOnTopHint)
+        self.label = QLabel("Opening the camera...")
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setMinimumSize(480, 270)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.addWidget(self.label)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+
+    def _tick(self):
+        if self.engine.preview is not None:
+            self.label.setPixmap(QPixmap.fromImage(to_qimage(self.engine.preview)))
+
+    def showEvent(self, event):
+        if not self.counted:
+            self.engine.preview_wanted += 1
+            self.counted = True
+        self.timer.start(66)
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        if self.counted:
+            self.engine.preview_wanted -= 1
+            self.counted = False
+        self.timer.stop()
+        super().hideEvent(event)
+
+
 class Bridge(QObject):
     """Lets the engine thread poke the GUI thread."""
     enabled_changed = Signal()
@@ -597,6 +694,14 @@ class MainWindow(QWidget):
         self.vcam_note.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.vcam_note.setVisible(virtualcam.AVAILABLE)
 
+        self.cal_preview = QCheckBox("Show the camera in a corner while calibrating")
+        self.cal_preview.setChecked(cfg["calibration_preview"])
+        self.cal_preview.toggled.connect(lambda on: self._set("calibration_preview", on))
+        self.preview_win = PreviewWindow(engine)
+        self.preview_btn = QPushButton("Camera view...")
+        self.preview_btn.setToolTip("See what the tracker detects: face mesh, irises and live values")
+        self.preview_btn.clicked.connect(lambda: (self.preview_win.show(), self.preview_win.raise_()))
+
         self.autostart = QCheckBox("Start at login")
         self.autostart.setChecked(autostart.is_enabled())
         self.autostart.toggled.connect(autostart.set_enabled)
@@ -626,10 +731,14 @@ class MainWindow(QWidget):
         layout.addWidget(self.show_gaze)
         layout.addWidget(self.vcam)
         layout.addWidget(self.vcam_note)
+        layout.addWidget(self.cal_preview)
         layout.addWidget(self.autostart)
         self.gestures_btn = QPushButton("Gestures...")
         self.gestures_btn.clicked.connect(lambda: GesturesDialog(self, self.engine, self.cfg).exec())
-        layout.addWidget(self.gestures_btn)
+        tools = QHBoxLayout()
+        tools.addWidget(self.gestures_btn)
+        tools.addWidget(self.preview_btn)
+        layout.addLayout(tools)
         buttons = QHBoxLayout()
         buttons.addWidget(self.quick_btn)
         buttons.addWidget(self.full_btn)
@@ -723,7 +832,8 @@ class MainWindow(QWidget):
         self._update_vcam_note()
 
     def _move_dot(self):
-        want = self.cfg["mode"] == "window" and self.cfg["show_gaze"] and self.engine.gaze is not None
+        want = (self.cfg["mode"] == "window" and self.cfg["show_gaze"] and self.engine.gaze is not None
+                and not self.engine.calibrating)          # while calibrating it would show the old model
         if not want:
             if self.dot:
                 self.dot.hide()

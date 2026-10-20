@@ -73,11 +73,40 @@ class GazeTest(unittest.TestCase):
         self.assertEqual(sorted(model.point_errors), list(range(18)))
         self.assertTrue(all(e > 0 for e in model.point_errors.values()))
 
+    def test_drops_features_that_are_only_noise(self):
+        x, y, g = synthetic(noise=0.3, seed=5)               # columns 2, 3, 4 are pure noise
+        model = fit(x, y, g)
+        self.assertTrue({0, 1, 5}.issubset(model.active))
+        self.assertFalse({2, 3}.intersection(model.active))
+
+    def test_a_spiky_frame_cannot_throw_the_estimate_off_screen(self):
+        rng = np.random.default_rng(11)
+        groups = np.repeat(np.arange(18), 25)
+        centers = rng.normal(0, 1, (18, 4))
+        x = centers[groups] + rng.normal(0, 0.05, (len(groups), 4))
+        y = np.stack([960 + 400 * x[:, 0] + 150 * x[:, 1] ** 2, 540 + 250 * x[:, 2]], axis=1)
+        model = fit(x, y, groups)
+        spike = x[0].copy()
+        spike[:] = 12                                         # a 12-sigma glitch on every feature
+        px, py = model.predict(spike)
+        for value, col in ((px, y[:, 0]), (py, y[:, 1])):     # unclamped this is ~15x the data range
+            beyond = max(0.0, value - col.max(), col.min() - value)
+            self.assertLess(beyond, 0.5 * np.ptp(col))
+
     def test_roundtrip_dict(self):
         x, y, g = synthetic(noise=0.2)
         model = fit(x, y, g)
         again = GazeModel.from_dict(model.to_dict())
         self.assertEqual(model.predict(x[5]), again.predict(x[5]))
+
+    def test_median_window_ignores_a_one_frame_spike(self):
+        s = Smoother(factor=1.0, window=5)
+        for _ in range(4):
+            s.update((100.0, 100.0))
+        self.assertEqual(s.update((5000.0, -4000.0)), (100.0, 100.0))        # the spike is outvoted
+        for _ in range(4):
+            out = s.update((200.0, 200.0))
+        self.assertEqual(out, (200.0, 200.0))                                # a real move gets through
 
     def test_smoother(self):
         s = Smoother(0.5)

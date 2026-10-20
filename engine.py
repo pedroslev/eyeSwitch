@@ -10,6 +10,7 @@ import time
 import numpy as np
 
 import backends
+import preview
 import virtualcam
 from backends.base import parse_keys
 from camwatch import CameraWatcher
@@ -29,6 +30,7 @@ DEFAULTS = {
     "typing_wait_s": 2.0,       # window mode: no same-monitor window changes this soon after typing
     "show_gaze": False,         # draw the estimated gaze point (for testing)
     "virtual_camera": False,    # Linux: republish the camera as "eyeSwitch Camera" for video calls
+    "calibration_preview": True,  # show the camera view in a corner while calibrating
     "edge_px": 0,               # window mode: stay on the active window within this many px of it (0 = auto)
     "gestures": {               # facial gestures that press keys; bindings come from the Gestures dialog
         "enabled": False,
@@ -246,6 +248,8 @@ class Engine:
         self.gesture_scores = {}        # label -> latest score (0 relaxed, 1 gesture), for live feedback
         self.gesture_log = ""           # what the last gesture did, or why it failed
         self.shapes_seen = 0.0          # monotonic time of the last frame that carried blendshapes
+        self.preview = None             # latest debug image (BGR array), rendered while preview_wanted > 0
+        self.preview_wanted = 0         # how many views want it (the window, a calibration)
         self.calibrating = False
         self.on_change = None           # called from the worker thread when `enabled` flips
         self.monitors = backends.Session().monitors()
@@ -305,6 +309,16 @@ class Engine:
             samples, self._shape_capture = self._shape_capture or [], None
         return samples
 
+    def _render_preview(self, tracker, face, frame):
+        lines = [self.status, f"{frame.shape[1]}x{frame.shape[0]}"]
+        if face is not None:
+            lines += [f"yaw {face.yaw:+6.1f}   pitch {face.pitch:+6.1f}",
+                      f"iris h {face.h:+.3f}   v {face.v:+.3f}",
+                      f"head x{face.tx:+.0f} y{face.ty:+.0f} z{face.tz:+.0f} cm"]
+        if self.gaze:
+            lines.append(f"gaze {self.gaze[0]:.0f}, {self.gaze[1]:.0f}")
+        return preview.render(frame, tracker.landmarks, lines)
+
     # --- gestures ----------------------------------------------------------
     def active_gestures(self):
         """Bindings that are switched on and trained."""
@@ -361,13 +375,13 @@ class Engine:
         px, py = xs.pointer()
         current = xs.monitor_at(self.monitors, px, py) or 0
         mouse_time, smooth, cand, cand_since = 0.0, None, None, 0.0
-        gaze_filter, win_checked, win_under, active_bounds = Smoother(), 0.0, None, None
+        gaze_filter, win_checked, win_under, active_bounds = Smoother(window=5), 0.0, None, None
         suppress_until, gesture_state = 0.0, (-1, [])      # (version, [(binding, model, detector)])
 
         while not self._stop.is_set():
             if hotkey_ok and xs.hotkey_pressed():
                 self.set_enabled(not self.cfg["enabled"])
-            if not (self.cfg["enabled"] or self.calibrating):
+            if not (self.cfg["enabled"] or self.calibrating or self.preview_wanted > 0):
                 camera.release()                  # let other apps have the camera while paused
                 self.yaw = self.gaze = None
                 smooth, cand = None, None
@@ -389,6 +403,8 @@ class Engine:
             now = time.monotonic()
             monitors = self.monitors = xs.monitors()
             window_mode = self.window_mode
+            if self.preview_wanted > 0:
+                self.preview = self._render_preview(camera.tracker, face, frame)
 
             # Track the user's own activity so focus can be restored later.
             nx, ny = xs.pointer()
