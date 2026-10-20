@@ -75,27 +75,24 @@ def ensure_model():
 TRACK_FPS = 15          # face tracking rate; the camera may run faster to feed a virtual camera
 
 
+# Tried in this order when the resolution is "auto". Not 4K: the iris landmarks stop improving and the
+# extra pixels only cost CPU. At 640x480 an eye is ~20 px wide, at 1080p ~54 px.
+SIZES = ((1920, 1080), (1280, 720), (640, 480))
+
+
 class HeadTracker:
-    def __init__(self, camera=0, sink=None, hires=False, blendshapes=False, height=720):
-        """`sink(frame)` receives every camera frame (for the virtual camera) at 720p30 so calls look
-        good, while tracking still runs at TRACK_FPS. `hires` asks for 720p without a sink: gaze
-        needs it, because at 640x480 an eye is only ~20 px wide."""
+    def __init__(self, camera=0, sink=None, blendshapes=False, height="auto"):
+        """Opens the camera at the best resolution it really delivers (`height` "auto"), or at 1080/720
+        when asked and possible. `sink(frame)` receives every camera frame (for the virtual camera, at
+        30 fps so calls look good) while tracking still runs at TRACK_FPS."""
         ensure_model()
         self.sink = sink
-        hires = hires or sink is not None
-        if hires:       # 720p or 1080p (1080p: ~20-30% less noise in pitch and iris offset, more CPU)
-            width, height, fps = (1920 if height >= 1080 else 1280), (1080 if height >= 1080 else 720), \
-                (30 if sink else TRACK_FPS)
-        else:
-            width, height, fps = 640, 480, TRACK_FPS
         self.cap = cv2.VideoCapture(camera, _capture_api())
-        if hires:
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))   # needed for 720p30
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
         if not self.cap.isOpened():
             raise RuntimeError(f"cannot open camera {camera}")
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))    # raw formats cannot carry HD over USB
+        self.cap.set(cv2.CAP_PROP_FPS, 30 if sink else TRACK_FPS)
+        self.width, self.height = self._pick_size(height)
         opts = vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
             running_mode=vision.RunningMode.VIDEO,
@@ -110,6 +107,20 @@ class HeadTracker:
         self.min_interval = 0.8 / TRACK_FPS          # 0.8: do not skip frames to timing jitter
         self._last = 0.0
         self._t0 = time.monotonic()
+
+    def _pick_size(self, height):
+        """The first size the camera really delivers: the best one, or the asked height if it can."""
+        wanted = SIZES if height == "auto" else [z for z in SIZES if z[1] == int(height)] or SIZES
+        got = wanted[-1]
+        for w, h in wanted:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            ok, frame = self.cap.read()                  # the camera may need a frame to switch modes
+            if ok:
+                got = (frame.shape[1], frame.shape[0])
+                if got == (w, h):
+                    break
+        return got
 
     def read(self):
         """Return (Face or None, frame) at about TRACK_FPS. Extra frames go to the sink."""

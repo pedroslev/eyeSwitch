@@ -112,7 +112,10 @@ What was tried on real calibration data (36 dots, leave-one-dot-out error; the c
 | tan() of the angles (a pinhole-camera model), one model per monitor, kernel ridge | same or worse |
 | Quadratic instead of linear | same (the fit picks linear on its own) |
 | Head pose only, no irises | 282 px: the irises cut the error by more than half |
-| 1080p instead of 720p | 7-32% less noise in pitch and iris offset (little in yaw and vertical iris) |
+| 1080p instead of 720p | 7-32% less noise in pitch and iris offset (little in yaw and vertical iris); costs about 20% of one CPU core more (78% against 58% of a core at 15 fps) |
+
+That is why the camera runs at its best resolution, up to 1080p, in every mode (4K is not tried: the iris
+landmarks stop improving and the pixels only cost CPU).
 
 The remaining error is mostly vertical (8% of the screen height against 4% of the width): the eyelid
 hides part of the iris when you look up or down, and at 720p an eye is only ~36 px wide.
@@ -127,8 +130,8 @@ The quick calibration discards a previous gaze model, since both describe the sa
 
 Settings: camera, mode, delay before switching monitor (default 300 ms), delay before focusing a
 window (500 ms), steadiness 1-5 (how firmly the gaze point is held still; higher is steadier and a little slower),
-camera resolution (720p or 1080p; a calibration only fits the resolution it was made at, and eyeSwitch
-says so if they differ),
+camera resolution (Auto by default: the best the camera really delivers, up to 1080p; or 1080p / 720p.
+A gaze calibration only fits the resolution it was made at, and eyeSwitch says so if they differ),
 window edge tolerance (keeps the focus on the active window while your gaze is within
 this distance of it, `auto` follows the gaze error; raise it if focus flickers between two windows), wait after typing (2 s: window mode never changes focus inside a monitor while you
 are typing), start at login. Ctrl+Shift+G pauses and resumes; while paused the camera is released.

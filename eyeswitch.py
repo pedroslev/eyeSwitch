@@ -341,7 +341,7 @@ class FullCalibration(CalibrationBase):
             guess = np.median([held_out.predict(f) for f in feats], axis=0)
             check_errors.append(float(np.hypot(*(guess - targets[0]))))
         model = gaze.fit(*self._rows(grid + check), column_sets=GAZE_COLUMN_SETS)
-        self.engine.set_calibration(yaws, self.monitors, model, self.engine.cfg.get("camera_height", 720))
+        self.engine.set_calibration(yaws, self.monitors, model, getattr(self.engine, "active_height", None))
 
         width = statistics.mean(m.w for m in self.monitors)
         edge, inner, report = [], [], []
@@ -539,12 +539,14 @@ class MainWindow(QWidget):
         self.edge_px.setToolTip("Keep the focus on the active window while your gaze is within this "
                                 "distance of it. Raise it if focus flickers between two windows.")
         self.resolution = QComboBox()
+        self.resolution.addItem("Auto: the camera's best (up to 1080p)", "auto")
+        self.resolution.addItem("1080p", 1080)
         self.resolution.addItem("720p", 720)
-        self.resolution.addItem("1080p: sharper eyes, more CPU", 1080)
         self.resolution.setCurrentIndex(max(self.resolution.findData(cfg["camera_height"]), 0))
-        self.resolution.setToolTip("Camera resolution in window mode. Sharper pitch and iris readings at 1080p. "
-                                   "A calibration only fits the resolution it was made at: calibrate again "
-                                   "after changing it.")
+        self.resolution.setToolTip("Camera resolution. Auto picks the best one the camera really delivers, up to "
+                                   "1080p (more pixels give steadier pitch and iris readings; 4K is not worth "
+                                   "its CPU). A gaze calibration only fits the resolution it was made at: "
+                                   "calibrate again after changing it.")
         self.resolution.currentIndexChanged.connect(self._on_resolution)
         self.stability = self._spin(QSpinBox(), 1, 5, 1, "", cfg["stability"], "stability")
         self.stability.setToolTip("How steady the gaze point is: higher holds it still more firmly and "
@@ -588,13 +590,13 @@ class MainWindow(QWidget):
 
         self.form = QFormLayout()
         self.form.addRow("Camera", self.camera)
+        self.form.addRow("Camera resolution", self.resolution)
         self.form.addRow("Mode", self.mode)
         self.form.addRow("Delay before switching monitor", self.delay)
         self.form.addRow("Delay before focusing a window", self.window_delay)
         self.form.addRow("Wait after typing", self.typing_wait)
         self.form.addRow("Window edge tolerance", self.edge_px)
         self.form.addRow("Steadiness (1-5)", self.stability)
-        self.form.addRow("Camera resolution", self.resolution)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -656,7 +658,7 @@ class MainWindow(QWidget):
 
     def _apply_mode(self):
         window = self.cfg["mode"] == "window"
-        for w in (self.window_delay, self.typing_wait, self.edge_px, self.stability, self.resolution):
+        for w in (self.window_delay, self.typing_wait, self.edge_px, self.stability):
             self.form.setRowVisible(w, window)
         self.show_gaze.setVisible(window)
         self.dot_timer.setInterval(16 if window and self.cfg["show_gaze"] else 400)
@@ -668,8 +670,8 @@ class MainWindow(QWidget):
             text = ("The saved gaze calibration comes from an older version and cannot be used: "
                     "run the full calibration again.")
         elif self.engine.resolution_mismatch:
-            text = (f"The gaze calibration was made at {self.engine.calib_height}p and the camera is set to "
-                    f"{self.cfg['camera_height']}p: run the full calibration again (or switch back).")
+            text = (f"The gaze calibration was made at {self.engine.calib_height}p and the camera now runs at "
+                    f"{self.engine.active_height}p: run the full calibration again (or change the resolution).")
         elif self.cfg["mode"] == "window" and self.engine.gaze_model is None:
             text = "Window mode needs the full calibration. Until then it works like monitor-only mode."
         elif self.cfg["mode"] == "window":

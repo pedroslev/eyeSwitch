@@ -24,6 +24,7 @@ class FakeEngine:
         self.calibrating, self.preview_wanted, self.preview = False, 0, None
         self.cap, self.saved = None, None
         self.want_shapes, self.last_capture, self.fail_captures = False, {"blink": 0, "moving": 0}, 0
+        self.active_height = 1080
         self.last_capture_raw = []
         self.quiet_polls, self.polls = 0, 0           # polls that report "no clean frames yet"
 
@@ -105,7 +106,7 @@ class CalibrationFlowTest(unittest.TestCase):
         self.assertIn("Check on 6 new dots", message)
         self.assertIn("good", message)
         yaws, model, height = eng.saved
-        self.assertEqual(height, 720)
+        self.assertEqual(height, 1080)                            # the calibration remembers the camera height
         self.assertEqual(len(yaws), 2)
         self.assertNotIn(6, model.active)                         # the noisy iris feature is dropped
         self.assertFalse({2, 3, 4} & set(model.active))           # head position is never a gaze feature

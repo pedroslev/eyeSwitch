@@ -32,7 +32,8 @@ DEFAULTS = {
     "show_gaze": False,         # draw the estimated gaze point (for testing)
     "virtual_camera": False,    # Linux: republish the camera as "eyeSwitch Camera" for video calls
     "calibration_preview": True,  # show the camera view in a corner while calibrating
-    "camera_height": 720,       # window mode: 720 or 1080 (a calibration only fits the resolution it was made at)
+    "camera_height": "auto",    # "auto" = the camera's best (up to 1080p), or 1080 / 720; a gaze calibration
+                                # only fits the resolution it was made at
     "stability": 3,             # window mode, 1..5: how steady the gaze point is (higher = steadier, slower)
     "edge_px": 0,               # window mode: stay on the active window within this many px of it (0 = auto)
     "gestures": {               # facial gestures that press keys; bindings come from the Gestures dialog
@@ -156,7 +157,7 @@ class Camera:
 
     def _wanted(self):
         cfg = self.engine.cfg
-        return (cfg["camera"], bool(cfg["virtual_camera"]) and virtualcam.AVAILABLE, cfg["mode"] == "window",
+        return (cfg["camera"], bool(cfg["virtual_camera"]) and virtualcam.AVAILABLE,
                 self.engine.want_shapes or bool(self.engine.active_gestures()) or cfg["mode"] == "window",
                 cfg["camera_height"])
 
@@ -218,7 +219,7 @@ class Camera:
         return self._open(key, now)
 
     def _open(self, key, now):
-        e, (cam, want_vcam, hires, shapes, height) = self.engine, key
+        e, (cam, want_vcam, shapes, height) = self.engine, key
         if self.watcher:
             self.watcher.ignore_for(2.0)                  # the opens below are ours
         sink, e.vcam_state = None, "off"
@@ -233,7 +234,8 @@ class Camera:
                 except Exception as ex:
                     e.vcam_state = f"error: {ex}"
         try:
-            self.tracker, self.key, self.yielded = HeadTracker(cam, sink, hires, shapes, height), key, False
+            self.tracker, self.key, self.yielded = HeadTracker(cam, sink, shapes, height), key, False
+            e.active_height = self.tracker.height
             return True
         except Exception as ex:
             if self.vcam:
@@ -273,7 +275,8 @@ class Engine:
         self.on_change = None           # called from the worker thread when `enabled` flips
         self.monitors = backends.Session().monitors()
         self.centers, self.calib_monitors, self.gaze_model = None, None, None
-        self.calib_height = 720         # camera resolution the gaze model was calibrated at
+        self.calib_height = None        # camera height the gaze model was calibrated at (None: unknown)
+        self.active_height = None       # camera height in use right now (None: camera not opened yet)
         self._capture = self._shape_capture = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -287,7 +290,7 @@ class Engine:
             with open(CALIB_PATH) as f:
                 data = json.load(f)
             self.centers, self.calib_monitors = data["yaw"], data["monitors"]
-            self.calib_height = data.get("camera_height", 720)
+            self.calib_height = data.get("camera_height")
             if data.get("gaze"):
                 model = GazeModel.from_dict(data["gaze"])
                 if len(model.mean) == len(Face._fields):
@@ -304,7 +307,8 @@ class Engine:
     @property
     def resolution_mismatch(self):
         """The gaze model was calibrated at another camera resolution than the one in use."""
-        return self.gaze_model is not None and self.calib_height != self.cfg["camera_height"]
+        return (self.gaze_model is not None and self.calib_height is not None
+                and self.active_height is not None and self.calib_height != self.active_height)
 
     @property
     def window_mode(self):
@@ -314,9 +318,9 @@ class Engine:
 
     def set_calibration(self, yaws, monitors, model=None, camera_height=None):
         """Store per-monitor head yaws; `model` is the gaze model of a full calibration, made with the
-        camera at `camera_height` (the current setting by default)."""
+        camera at `camera_height` (the height in use by default)."""
         self.centers, self.calib_monitors, self.gaze_model = list(yaws), [list(m) for m in monitors], model
-        self.calib_height = camera_height or self.cfg["camera_height"]
+        self.calib_height = camera_height or self.active_height
         self.stale_model = False
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CALIB_PATH, "w") as f:

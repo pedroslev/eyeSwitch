@@ -81,16 +81,17 @@ class FakeSession(BaseSession):
 
 
 class FakeTracker:
-    face, opens, closes, args = None, 0, 0, None     # args: (camera, has_sink, hires) of the last open
+    face, opens, closes, args = None, 0, 0, None     # args: (camera, has_sink) of the last open
     fail_open, no_frames, shapes_on, shapes = False, False, None, None
     frame = np.zeros((48, 64, 3), np.uint8)
 
-    def __init__(self, camera=0, sink=None, hires=False, blendshapes=False, height=720):
+    def __init__(self, camera=0, sink=None, blendshapes=False, height="auto"):
         if FakeTracker.fail_open:
             raise RuntimeError("device busy")
         FakeTracker.opens += 1
-        FakeTracker.args = (camera, sink is not None, hires)
-        FakeTracker.height = height
+        FakeTracker.args = (camera, sink is not None)
+        FakeTracker.height_asked = height
+        self.height = 1080 if height == "auto" else height     # what a 1080p camera would deliver
         FakeTracker.shapes_on = blendshapes
         self.sink = sink
         self.landmarks = None
@@ -456,27 +457,39 @@ class EngineTest(unittest.TestCase):
         self.assertEqual((landmarks.shape, matrix.shape, size, shapes), ((478, 3), (4, 4), (64, 48),
                                                                           {"eyeLookUpLeft": 0.1}))
 
-    def test_the_camera_resolution_setting_reaches_the_tracker(self):
-        self.start("window", camera_height=1080)
-        self.assertTrue(self.wait_for(lambda: getattr(FakeTracker, "height", None) == 1080))
+    def test_a_chosen_resolution_reaches_the_tracker(self):
+        e = self.start("window", camera_height=720)
+        self.assertTrue(self.wait_for(lambda: e.active_height == 720))
+        self.assertEqual(FakeTracker.height_asked, 720)
 
     def test_a_gaze_model_calibrated_at_another_resolution_is_not_used(self):
         e = self.start("window", camera_height=720)
+        self.assertTrue(self.wait_for(lambda: e.active_height == 720))
+        e.set_calibration([-20.0, 20.0], MONITORS, identity_model(), 720)
         self.assertTrue(e.window_mode)
         e.cfg["camera_height"] = 1080                                   # changed without recalibrating
+        self.assertTrue(self.wait_for(lambda: e.active_height == 1080))
         self.assertTrue(e.resolution_mismatch)
         self.assertFalse(e.window_mode)
-        e.set_calibration([-20.0, 20.0], MONITORS, identity_model())    # a new calibration at 1080p
+        e.set_calibration([-20.0, 20.0], MONITORS, identity_model())    # a new calibration, at what is in use
         self.assertEqual(e.calib_height, 1080)
         self.assertTrue(e.window_mode)
 
+    def test_a_calibration_without_a_known_height_is_never_blocked(self):
+        e = self.start("window")
+        self.assertTrue(self.wait_for(lambda: e.active_height == 1080))
+        e.calib_height = None
+        self.assertFalse(e.resolution_mismatch)
+        self.assertTrue(e.window_mode)
+
     def test_the_calibration_remembers_its_resolution_across_restarts(self):
-        e = self.start("window", camera_height=1080)
+        e = self.start("window")
         e.set_calibration([-20.0, 20.0], MONITORS, identity_model(), 1080)
-        again = engine_mod.Engine({**engine_mod.DEFAULTS, "mode": "window", "camera_height": 1080})
+        again = engine_mod.Engine({**engine_mod.DEFAULTS, "mode": "window"})
         self.engines.append(again)
         self.assertEqual(again.calib_height, 1080)
-        self.assertFalse(again.resolution_mismatch)
+        again.active_height = 720                                       # the camera now gives something else
+        self.assertTrue(again.resolution_mismatch)
 
     # --- debug view --------------------------------------------------------
     def test_preview_is_rendered_only_while_someone_watches(self):
@@ -530,15 +543,12 @@ class EngineTest(unittest.TestCase):
         FakeTracker.no_frames = True
         self.assertTrue(self.wait_for(lambda: "no frames" in e.status))
 
-    def test_window_mode_asks_for_high_resolution(self):
-        self.start("window")
-        self.assertTrue(self.wait_for(lambda: FakeTracker.args is not None))
-        self.assertEqual(FakeTracker.args, (0, False, True))
-
-    def test_monitor_mode_keeps_low_resolution(self):
-        self.start("monitor")
-        self.assertTrue(self.wait_for(lambda: FakeTracker.args is not None))
-        self.assertEqual(FakeTracker.args, (0, False, False))
+    def test_every_mode_asks_for_the_cameras_best_resolution(self):
+        for mode in ("monitor", "window"):
+            e = self.start(mode)
+            self.assertTrue(self.wait_for(lambda: e.active_height == 1080))
+            self.assertEqual(FakeTracker.height_asked, "auto")
+            e.stop()
 
     def test_virtual_camera_receives_every_frame(self):
         e = self.start("monitor", virtual_camera=True)
@@ -546,7 +556,7 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: FakeVCam.instance and FakeVCam.instance.frames > 5))
         self.assertEqual(e.vcam_state, "active")
         self.assertEqual(FakeVCam.instance.device, "/dev/video99")
-        self.assertEqual(FakeTracker.args, (0, True, False))
+        self.assertEqual(FakeTracker.args, (0, True))
 
     def test_virtual_camera_not_set_up_still_tracks(self):
         virtualcam.find_device = lambda: None
@@ -560,7 +570,7 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: FakeTracker.opens == 1))
         e.cfg["virtual_camera"] = True
         self.assertTrue(self.wait_for(lambda: FakeTracker.opens == 2))
-        self.assertEqual(FakeTracker.args, (0, True, False))
+        self.assertEqual(FakeTracker.args, (0, True))
 
     def test_pause_closes_camera_and_virtual_camera(self):
         e = self.start("monitor", virtual_camera=True)
