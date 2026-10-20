@@ -5,7 +5,8 @@ import unittest
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from samples import MAX_BLINK_FRAMES, PAD_AFTER, PAD_BEFORE, BlinkDetector, clean_capture  # noqa: E402
+from samples import (MAX_BLINK_FRAMES, PAD_AFTER, PAD_BEFORE, BlinkDetector, clean_capture,  # noqa: E402
+                     clean_indices)
 
 
 def feed(scores):
@@ -52,6 +53,13 @@ class CleanCaptureTest(unittest.TestCase):
         self.assertEqual(stats["moving"], 14)
         slow, _ = clean_capture(records(14, yaw_step=0.5))                  # 7 deg/s: a slow, steady turn
         self.assertEqual(len(slow), 14)
+
+    def test_indices_line_up_with_the_faces_that_survive(self):
+        recs = records(20, blink_at={10})
+        kept, _ = clean_indices(recs)
+        faces, _ = clean_capture(recs)
+        self.assertEqual([recs[i][1] for i in kept], faces)
+        self.assertNotIn(10, kept)
 
     def test_empty_capture(self):
         self.assertEqual(clean_capture([]), ([], {"total": 0, "blink": 0, "moving": 0}))

@@ -16,7 +16,7 @@ from backends.base import parse_keys
 from camwatch import CameraWatcher
 from gaze import FixationFilter, GazeModel, OneEuro
 from gestures import Detector, GestureModel
-from samples import PAD_AFTER, BlinkDetector, clean_capture
+from samples import PAD_AFTER, BlinkDetector, clean_capture, clean_indices
 from tracker import Face, HeadTracker
 
 CONFIG_DIR = backends.config_dir()
@@ -266,6 +266,7 @@ class Engine:
         self.out_of_range = False       # pose is far outside what was calibrated (camera or seat moved)
         self.stale_model = False        # a saved gaze model from an older tracker: recalibrate
         self.last_capture = {}          # stats of the last capture: frames kept, blinks and motion dropped
+        self.last_capture_raw = []      # raw geometry of the kept frames, aligned with the faces returned
         self.calibrating = False
         self.on_change = None           # called from the worker thread when `enabled` flips
         self.monitors = backends.Session().monitors()
@@ -319,8 +320,9 @@ class Engine:
         is still travelling are dropped. `last_capture` says how many went."""
         with self._lock:
             records, self._capture = self._capture or [], None
-        faces, self.last_capture = clean_capture(records)
-        return faces
+        kept, self.last_capture = clean_indices(records)
+        self.last_capture_raw = [records[i][3] for i in kept]
+        return [records[i][1] for i in kept]
 
     def capture_clean_count(self):
         """How many clean frames the capture in progress has so far (blinks and motion excluded)."""
@@ -483,7 +485,7 @@ class Engine:
             blinking = self.blinking = now < blink_until
             with self._lock:
                 if self._capture is not None:
-                    self._capture.append((now, face, flagged))
+                    self._capture.append((now, face, flagged, camera.tracker.raw()))
                 if self._shape_capture is not None and camera.tracker.shapes:
                     self._shape_capture.append(dict(camera.tracker.shapes))
             smooth = face.yaw if smooth is None else smooth + SMOOTH * (face.yaw - smooth)

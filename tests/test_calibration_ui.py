@@ -24,6 +24,7 @@ class FakeEngine:
         self.calibrating, self.preview_wanted, self.preview = False, 0, None
         self.cap, self.saved = None, None
         self.want_shapes, self.last_capture, self.fail_captures = False, {"blink": 0, "moving": 0}, 0
+        self.last_capture_raw = []
         self.quiet_polls, self.polls = 0, 0           # polls that report "no clean frames yet"
 
     @property
@@ -44,7 +45,10 @@ class FakeEngine:
         out, self.cap = self.cap or [], None
         if self.fail_captures > 0:                # a capture ruined by blinks
             self.fail_captures -= 1
+            self.last_capture_raw = []
             return []
+        self.last_capture_raw = [(np.zeros((478, 3), np.float32), np.eye(4, dtype=np.float32), (1280, 720))
+                                 for _ in out]
         return out
 
     def set_calibration(self, yaws, monitors, model=None):
@@ -107,6 +111,11 @@ class CalibrationFlowTest(unittest.TestCase):
         self.assertEqual(len(cal.steps), 36)                      # 2 x (15 grid + 3 check)
         self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "calibration_samples.npz")))
         self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "calibration_report.json")))
+        raw = np.load(os.path.join(self.tmp.name, "calibration_raw.npz"))       # same rows as the features
+        feats = np.load(os.path.join(self.tmp.name, "calibration_samples.npz"))["features"]
+        self.assertEqual(len(raw["landmarks"]), len(feats))
+        self.assertEqual(raw["landmarks"].shape[1:], (478, 3))
+        self.assertEqual(raw["matrices"].shape[1:], (4, 4))
         self.assertFalse(eng.calibrating)
 
     def test_a_dot_ruined_by_blinks_is_shown_again_once(self):

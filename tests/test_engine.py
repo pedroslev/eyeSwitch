@@ -111,6 +111,9 @@ class FakeTracker:
             self.sink("frame")
         return FakeTracker.face, FakeTracker.frame
 
+    def raw(self):
+        return np.zeros((478, 3), np.float32), np.eye(4, dtype=np.float32), (64, 48)
+
     def close(self):
         FakeTracker.closes += 1
 
@@ -438,6 +441,18 @@ class EngineTest(unittest.TestCase):
         samples = e.end_shape_capture()
         self.assertGreater(len(samples), 5)
         self.assertEqual(samples[0], {"browInnerUp": 0.3})
+
+    def test_a_capture_keeps_the_raw_geometry_aligned_with_the_faces(self):
+        e = self.start("monitor")
+        FakeTracker.face = looking_at(500, 500)
+        time.sleep(0.3)
+        e.begin_capture()
+        time.sleep(0.4)
+        faces = e.end_capture()
+        self.assertGreater(len(faces), 5)
+        self.assertEqual(len(e.last_capture_raw), len(faces))
+        landmarks, matrix, size = e.last_capture_raw[0]
+        self.assertEqual((landmarks.shape, matrix.shape, size), ((478, 3), (4, 4), (64, 48)))
 
     # --- debug view --------------------------------------------------------
     def test_preview_is_rendered_only_while_someone_watches(self):

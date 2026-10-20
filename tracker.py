@@ -100,7 +100,7 @@ class HeadTracker:
             output_face_blendshapes=blendshapes,
         )
         self.shapes = None           # {blendshape name: 0..1} of the last frame, when enabled
-        self.landmarks = None
+        self.landmarks = self.matrix = self.frame_wh = None
         self.blink = None            # mean eyelid closure score 0..1 (needs blendshapes)
         self.landmarker = vision.FaceLandmarker.create_from_options(opts)
         self.min_interval = 0.8 / TRACK_FPS          # 0.8: do not skip frames to timing jitter
@@ -129,9 +129,17 @@ class HeadTracker:
                       (self.shapes["eyeBlinkLeft"] + self.shapes["eyeBlinkRight"]) / 2)
         if not res.facial_transformation_matrixes:
             return None, frame
-        face = _face(np.array(res.facial_transformation_matrixes[0]),
-                     res.face_landmarks[0], frame.shape[1], frame.shape[0])
+        self.matrix, self.frame_wh = np.array(res.facial_transformation_matrixes[0]), (frame.shape[1], frame.shape[0])
+        face = _face(self.matrix, res.face_landmarks[0], frame.shape[1], frame.shape[0])
         return face, frame
+
+    def raw(self):
+        """The last frame's raw geometry: (478x3 landmarks, 4x4 face pose, frame size). Numbers only,
+        no image. Saved with calibrations so other models can be tried on the same data offline."""
+        if self.landmarks is None or self.matrix is None:
+            return None
+        pts = np.array([[p.x, p.y, p.z] for p in self.landmarks], np.float32)
+        return pts, self.matrix.astype(np.float32), self.frame_wh
 
     def close(self):
         self.cap.release()

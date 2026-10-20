@@ -41,8 +41,8 @@ class BlinkDetector:
         return False
 
 
-def clean_capture(records):
-    """records: [(t, face, blinking)] -> (faces worth keeping, stats).
+def clean_indices(records):
+    """records: [(t, face, blinking, ...)] -> (indices worth keeping, stats).
 
     Drops blink frames with padding on both sides, and frames where the head is still moving.
     """
@@ -59,5 +59,11 @@ def clean_capture(records):
         speed = np.hypot(np.gradient(yaw, t), np.gradient(pitch, t))
         moving = speed > MAX_HEAD_SPEED
     keep = ~(blink | moving)
-    return [r[1] for r, k in zip(records, keep) if k], {
+    return [i for i, k in enumerate(keep) if k], {
         "total": len(t), "blink": int(blink.sum()), "moving": int((moving & ~blink).sum())}
+
+
+def clean_capture(records):
+    """Like clean_indices, but returns the faces themselves."""
+    kept, stats = clean_indices(records)
+    return [records[i][1] for i in kept], stats

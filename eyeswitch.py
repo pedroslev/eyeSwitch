@@ -234,7 +234,7 @@ class FullCalibration(CalibrationBase):
             rng.shuffle(grid)
             self.steps += [(mon, fx, fy, "grid") for fx, fy in grid]
             self.steps += [(mon, fx, fy, "check") for fx, fy in self.CHECKS]
-        self.samples, self.i, self.win_mon = [], 0, None
+        self.samples, self.raw, self.i, self.win_mon = [], [], 0, None
         self.retries, self.dropped_blink, self.dropped_move = {}, 0, 0
         self.t0 = time.monotonic()
         engine.want_shapes = True                    # blink scores need the face blendshapes
@@ -296,6 +296,7 @@ class FullCalibration(CalibrationBase):
             return self._finish(False, f"Not enough clean frames at point {self.i + 1} (blinks, movement or "
                                        "no face). Look at each dot steadily and try again.")
         self.samples.append(faces)
+        self.raw.append(list(getattr(self.engine, "last_capture_raw", [])))
         self.i += 1
         QTimer.singleShot(0, self._next)
 
@@ -309,6 +310,16 @@ class FullCalibration(CalibrationBase):
                 targets.append((m.x + fx * m.w, m.y + fy * m.h))
                 groups.append(k)
         return np.array(feats), np.array(targets), np.array(groups)
+
+    def _save_raw(self):
+        """Raw landmarks and face pose of every kept frame, in the same order as the saved feature rows,
+        so a different model can be tried on exactly the same calibration later. Numbers only."""
+        flat = [r for per_dot in self.raw for r in per_dot]
+        if not flat or any(r is None for r in flat) or len(flat) != sum(len(s) for s in self.samples):
+            return
+        np.savez_compressed(os.path.join(CONFIG_DIR, "calibration_raw.npz"),
+                            landmarks=np.stack([r[0] for r in flat]), matrices=np.stack([r[1] for r in flat]),
+                            frame_wh=np.array(flat[0][2]))
 
     def _solve(self):
         grid = [k for k, st in enumerate(self.steps) if st[3] == "grid"]
@@ -344,6 +355,7 @@ class FullCalibration(CalibrationBase):
             np.savez_compressed(os.path.join(CONFIG_DIR, "calibration_samples.npz"), features=feats,
                                 targets=targets, groups=groups, fields=np.array(Face._fields),
                                 steps=np.array([(m, x, y, 0 if kd == "grid" else 1) for m, x, y, kd in self.steps]))
+            self._save_raw()
             with open(os.path.join(CONFIG_DIR, "calibration_report.json"), "w") as f:
                 json.dump({"degree": model.degree, "features": used, "error_px": model.error_px,
                            "noise_px": model.noise_px, "check_mean_px": mean_check,
