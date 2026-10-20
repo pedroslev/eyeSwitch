@@ -3,6 +3,7 @@
 import ctypes.util
 import json
 import os
+import random
 import statistics
 import subprocess
 import sys
@@ -48,8 +49,9 @@ import backends  # noqa: E402
 import gaze  # noqa: E402
 import gestures  # noqa: E402
 import virtualcam  # noqa: E402
-from engine import CONFIG_DIR, Engine, load_config, nearest_monitor, save_config  # noqa: E402
-from tracker import list_cameras  # noqa: E402
+from engine import (CONFIG_DIR, GAZE_COLUMN_SETS, Engine, load_config, nearest_monitor,  # noqa: E402
+                    save_config)
+from tracker import Face, list_cameras  # noqa: E402
 
 MODES = [("Monitor only (head direction)", "monitor"), ("Monitor and window (gaze)", "window")]
 GRID_X = (0.06, 0.28, 0.5, 0.72, 0.94)  # dot positions of the full calibration, as screen fractions
@@ -210,25 +212,45 @@ class FullCalibration(CalibrationBase):
 
     The model is fitted on the grid; the check dots are new positions it has never seen, so the
     error measured on them is the real accuracy, not a promise. The final model uses all of them.
+
+    Blinks and frames where the head is still travelling are dropped from every dot, and a dot that
+    ends up with too few clean frames is shown again once. The dots come in random order: in a fixed
+    sweep, where the head points for a given dot depends on where it came from (about 5 degrees of
+    yaw in real data), which the fit then mistakes for a property of the position.
     """
 
     SETTLE_MS, SAMPLE_MS, INTRO_MS, CHECK_MS = 700, 900, 1800, 1200
+    TARGET_CLEAN, MAX_SAMPLE_MS = 10, 3000           # keep sampling until this many clean frames, up to this long
     CHECKS = ((0.17, 0.30), (0.62, 0.70), (0.83, 0.30))
+    MIN_CLEAN = 6                                    # clean frames a dot needs to count
 
     def __init__(self, engine, on_done):
         super().__init__(engine, on_done)
-        self.steps = []                              # (monitor, fx, fy, kind), snake order per monitor
+        rng = random.Random()
+        self.steps = []                              # (monitor, fx, fy, kind)
         for mon in range(len(self.monitors)):
-            for row, fy in enumerate(GRID_Y):
-                for fx in (GRID_X if row % 2 == 0 else GRID_X[::-1]):
-                    self.steps.append((mon, fx, fy, "grid"))
+            grid = [(fx, fy) for fy in GRID_Y for fx in GRID_X]
+            rng.shuffle(grid)
+            self.steps += [(mon, fx, fy, "grid") for fx, fy in grid]
             self.steps += [(mon, fx, fy, "check") for fx, fy in self.CHECKS]
         self.samples, self.i, self.win_mon = [], 0, None
+        self.retries, self.dropped_blink, self.dropped_move = {}, 0, 0
+        self.t0 = time.monotonic()
+        engine.want_shapes = True                    # blink scores need the face blendshapes
         self._next()
+
+    def _finish(self, ok, message):
+        self.engine.want_shapes = False
+        super()._finish(ok, message)
 
     def _next(self):
         if self.cancelled:
             return self._finish(False, "Calibration cancelled.")
+        if self.i == 0 and time.monotonic() - self.engine.shapes_seen > 0.5:      # camera not ready yet
+            if time.monotonic() - self.t0 > 12:
+                return self._finish(False, "No face data came from the camera. Is another app using it?")
+            QTimer.singleShot(100, self._next)
+            return
         if self.i == len(self.steps):
             return self._solve()
         mon, fx, fy, kind = self.steps[self.i]
@@ -250,14 +272,28 @@ class FullCalibration(CalibrationBase):
         self.win.set_text("")
         self.win.set_dot(*self.steps[self.i][1:3], sampling=True)
         self.engine.begin_capture()
+        self.sample_t0 = time.monotonic()
         QTimer.singleShot(self.SAMPLE_MS, self._end)
 
     def _end(self):
+        waited = (time.monotonic() - self.sample_t0) * 1000
+        if (not self.cancelled and waited < self.MAX_SAMPLE_MS
+                and self.engine.capture_clean_count() < self.TARGET_CLEAN):
+            return QTimer.singleShot(250, self._end)         # a blink got in the way: keep looking
         faces = self.engine.end_capture()
+        stats = self.engine.last_capture
+        self.dropped_blink += stats.get("blink", 0)
+        self.dropped_move += stats.get("moving", 0)
         if self.cancelled:
             return self._finish(False, "Calibration cancelled.")
-        if len(faces) < 8:
-            return self._finish(False, f"No face detected while looking at point {self.i + 1}.")
+        if len(faces) < self.MIN_CLEAN:
+            if self.retries.get(self.i, 0) < 1:      # a blink or a glance away: once more
+                self.retries[self.i] = self.retries.get(self.i, 0) + 1
+                self._next()
+                self.win.set_text("One more time: keep looking at the dot")
+                return
+            return self._finish(False, f"Not enough clean frames at point {self.i + 1} (blinks, movement or "
+                                       "no face). Look at each dot steadily and try again.")
         self.samples.append(faces)
         self.i += 1
         QTimer.singleShot(0, self._next)
@@ -281,13 +317,13 @@ class FullCalibration(CalibrationBase):
         if not self._check_spacing(yaws):
             return
 
-        held_out = gaze.fit(*self._rows(grid))
+        held_out = gaze.fit(*self._rows(grid), column_sets=GAZE_COLUMN_SETS)
         check_errors = []
         for k in check:
             feats, targets, _ = self._rows([k])
             guess = np.median([held_out.predict(f) for f in feats], axis=0)
             check_errors.append(float(np.hypot(*(guess - targets[0]))))
-        model = gaze.fit(*self._rows(grid + check))
+        model = gaze.fit(*self._rows(grid + check), column_sets=GAZE_COLUMN_SETS)
         self.engine.set_calibration(yaws, self.monitors, model)
 
         width = statistics.mean(m.w for m in self.monitors)
@@ -300,16 +336,18 @@ class FullCalibration(CalibrationBase):
             report.append({"monitor": mon + 1, "x": fx, "y": fy, "kind": kind, "error_px": err,
                            "samples": len(self.samples[k]), "edge": on_edge})
         mean_check, worst_check = statistics.mean(check_errors), max(check_errors)
+        used = [Face._fields[i] for i in model.active]
         try:                      # kept so a bad calibration can be analyzed offline
             feats, targets, groups = self._rows(range(len(self.steps)))
             os.makedirs(CONFIG_DIR, exist_ok=True)
             np.savez_compressed(os.path.join(CONFIG_DIR, "calibration_samples.npz"), features=feats,
-                                targets=targets, groups=groups,
+                                targets=targets, groups=groups, fields=np.array(Face._fields),
                                 steps=np.array([(m, x, y, 0 if kd == "grid" else 1) for m, x, y, kd in self.steps]))
             with open(os.path.join(CONFIG_DIR, "calibration_report.json"), "w") as f:
-                json.dump({"degree": model.degree, "features": model.active, "error_px": model.error_px,
-                           "check_mean_px": mean_check, "check_worst_px": worst_check, "points": report},
-                          f, indent=2)
+                json.dump({"degree": model.degree, "features": used, "error_px": model.error_px,
+                           "noise_px": model.noise_px, "check_mean_px": mean_check,
+                           "check_worst_px": worst_check, "dropped_blink_frames": self.dropped_blink,
+                           "dropped_moving_frames": self.dropped_move, "points": report}, f, indent=2)
         except OSError:
             pass
 
@@ -320,6 +358,8 @@ class FullCalibration(CalibrationBase):
         if edge and inner:
             message += (f"\nGrid points, centre ~{statistics.mean(inner):.0f} px, "
                         f"edges ~{statistics.mean(edge):.0f} px.")
+        message += (f"\nUses: {', '.join(used)}. Dropped {self.dropped_blink} blink and "
+                    f"{self.dropped_move} head-motion frames.")
         if verdict == "poor":
             message += ("\n\nThat is not good enough for window mode. Sit as you normally do, keep the camera "
                         "still and follow each dot with your head and eyes, then calibrate again. The camera "
@@ -680,6 +720,9 @@ class MainWindow(QWidget):
         self.edge_px.setSpecialValueText("auto")
         self.edge_px.setToolTip("Keep the focus on the active window while your gaze is within this "
                                 "distance of it. Raise it if focus flickers between two windows.")
+        self.stability = self._spin(QSpinBox(), 1, 5, 1, "", cfg["stability"], "stability")
+        self.stability.setToolTip("How steady the gaze point is: higher holds it still more firmly and "
+                                  "follows you a little later. Raise it if focus jumps around.")
         self.show_gaze = QCheckBox("Show where it thinks I am looking (test dot)")
         self.show_gaze.setChecked(cfg["show_gaze"])
         self.show_gaze.toggled.connect(self._on_show_gaze)
@@ -721,6 +764,7 @@ class MainWindow(QWidget):
         self.form.addRow("Delay before focusing a window", self.window_delay)
         self.form.addRow("Wait after typing", self.typing_wait)
         self.form.addRow("Window edge tolerance", self.edge_px)
+        self.form.addRow("Steadiness (1-5)", self.stability)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -782,7 +826,7 @@ class MainWindow(QWidget):
 
     def _apply_mode(self):
         window = self.cfg["mode"] == "window"
-        for w in (self.window_delay, self.typing_wait, self.edge_px):
+        for w in (self.window_delay, self.typing_wait, self.edge_px, self.stability):
             self.form.setRowVisible(w, window)
         self.show_gaze.setVisible(window)
         self.dot_timer.setInterval(50 if window and self.cfg["show_gaze"] else 400)
@@ -790,7 +834,10 @@ class MainWindow(QWidget):
         self.adjustSize()
 
     def _update_note(self):
-        if self.cfg["mode"] == "window" and self.engine.gaze_model is None:
+        if self.engine.stale_model:
+            text = ("The saved gaze calibration comes from an older version and cannot be used: "
+                    "run the full calibration again.")
+        elif self.cfg["mode"] == "window" and self.engine.gaze_model is None:
             text = "Window mode needs the full calibration. Until then it works like monitor-only mode."
         elif self.cfg["mode"] == "window":
             text = ("Window mode: look at a window and it gets focus. Redo the full calibration when "

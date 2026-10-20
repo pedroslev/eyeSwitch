@@ -1,4 +1,5 @@
 """Engine decision logic with a fake camera and a fake OS backend. Run: python -m unittest discover tests"""
+import json
 import os
 import sys
 import tempfile
@@ -97,6 +98,11 @@ class FakeTracker:
     def shapes(self):
         return FakeTracker.shapes if FakeTracker.shapes_on else None
 
+    @property
+    def blink(self):
+        s = FakeTracker.shapes if isinstance(FakeTracker.shapes, dict) else None
+        return None if not s else (s.get("eyeBlinkLeft", 0.0) + s.get("eyeBlinkRight", 0.0)) / 2
+
     def read(self):
         time.sleep(0.02)
         if FakeTracker.no_frames:
@@ -139,14 +145,14 @@ class FakeVCam:
 
 def looking_at(x, y, yaw=0.0):
     """A face whose gaze features (h, v) map straight onto desktop pixel (x, y)."""
-    return Face(yaw, 0, 0, 0, 0, x, y)
+    return Face(yaw, 0, 0, 0, 0, x, y, 0, 0)
 
 
 def identity_model():
-    w = np.zeros((8, 2))
+    w = np.zeros((10, 2))
     w[1 + 5, 0] = 1                  # x = h
     w[1 + 6, 1] = 1                  # y = v
-    return GazeModel(1, np.zeros(7), np.ones(7), w, 100.0)
+    return GazeModel(1, np.zeros(9), np.ones(9), w, 100.0)
 
 
 BROWS = GestureModel(["browInnerUp"], [1.0 / 0.7], 0.0, 4.0)    # score 1 when browInnerUp = 0.7
@@ -273,6 +279,66 @@ class EngineTest(unittest.TestCase):
         e = self.start("window")
         FakeTracker.face = looking_at(-500, 5000)            # the model overshoots wildly
         self.assertTrue(self.wait_for(lambda: e.gaze is not None and e.gaze == (0, 1079)))
+
+    # --- blinks, glitches, a pose that left the calibrated range -----------
+    def test_a_blink_holds_the_estimate_instead_of_following_it(self):
+        e = self.start("window")
+        FakeTracker.face = looking_at(500, 500)                           # window A, the active one
+        FakeTracker.shapes = {"eyeBlinkLeft": 0.2, "eyeBlinkRight": 0.2}
+        time.sleep(0.5)                                                   # the open-eye baseline
+        FakeTracker.shapes = {"eyeBlinkLeft": 0.7, "eyeBlinkRight": 0.7}  # lids close...
+        FakeTracker.face = looking_at(1400, 500)                          # ...and the estimate jumps to B
+        self.assertTrue(self.wait_for(lambda: e.blinking))
+        time.sleep(0.2)
+        FakeTracker.shapes = {"eyeBlinkLeft": 0.2, "eyeBlinkRight": 0.2}  # eyes open, looking at A again
+        FakeTracker.face = looking_at(500, 500)
+        time.sleep(1.0)
+        self.assertEqual(self.os.activated, [])
+
+    def test_the_same_jump_without_a_blink_does_change_focus(self):
+        self.start("window")
+        FakeTracker.face = looking_at(500, 500)
+        FakeTracker.shapes = {"eyeBlinkLeft": 0.2, "eyeBlinkRight": 0.2}
+        time.sleep(0.5)
+        FakeTracker.face = looking_at(1400, 500)                          # eyes open: a real look at B
+        self.assertTrue(self.wait_for(lambda: self.os.activated == [B]))
+
+    def test_a_one_frame_glitch_does_not_change_focus(self):
+        self.start("window")
+        FakeTracker.face = looking_at(500, 500)
+        time.sleep(0.3)
+        FakeTracker.face = looking_at(1400, 500)
+        time.sleep(0.03)                                                  # about one frame
+        FakeTracker.face = looking_at(500, 500)
+        time.sleep(0.8)
+        self.assertEqual(self.os.activated, [])
+
+    def test_a_pose_outside_the_calibrated_range_does_nothing_and_says_so(self):
+        e = self.start("window")
+        e.gaze_model.lo, e.gaze_model.hi = np.zeros(9), np.zeros(9)
+        e.gaze_model.hi[5], e.gaze_model.hi[6] = 3840, 1080
+        FakeTracker.face = looking_at(9000, 500)                          # far beyond what was calibrated
+        self.assertTrue(self.wait_for(lambda: e.out_of_range))
+        time.sleep(0.5)
+        self.assertEqual(self.os.activated, [])
+        self.assertIsNone(e.gaze)
+        self.assertIn("Outside the calibrated range", e.status)
+        FakeTracker.face = looking_at(1400, 500)                          # back inside: it works again
+        self.assertTrue(self.wait_for(lambda: self.os.activated == [B]))
+
+    def test_a_gaze_model_from_an_older_tracker_is_ignored(self):
+        stale = GazeModel(1, np.zeros(7), np.ones(7), np.zeros((8, 2)), 100.0)
+        with open(engine_mod.CALIB_PATH, "w") as f:
+            json.dump({"monitors": [list(m) for m in MONITORS], "yaw": [-20.0, 20.0], "gaze": stale.to_dict()}, f)
+        e = engine_mod.Engine({**engine_mod.DEFAULTS, "mode": "window"})
+        self.engines.append(e)
+        self.assertTrue(e.stale_model)
+        self.assertIsNone(e.gaze_model)
+        self.assertFalse(e.window_mode)
+
+    def test_window_mode_always_asks_for_blendshapes_for_blink_detection(self):
+        self.start("window")
+        self.assertTrue(self.wait_for(lambda: FakeTracker.shapes_on))
 
     # --- gestures ----------------------------------------------------------
     def gestures(self, mode, *bindings, **cfg):

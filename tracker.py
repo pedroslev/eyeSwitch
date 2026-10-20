@@ -21,9 +21,14 @@ MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
 RIGHT_EYE = (33, 133, 468)
 LEFT_EYE = (263, 362, 473)
 
-# Everything the gaze model can use. yaw/pitch in degrees, tx/ty/tz = head position in the
-# camera frame, h/v = iris offset inside the eye in eye widths (right/down positive).
-Face = namedtuple("Face", "yaw pitch tx ty tz h v")
+NOSE_TIP = 1
+
+# What the tracker measures per frame. yaw/pitch in degrees; tx/ty/tz = head position in the camera
+# frame (shown for debugging only: it says where you sit, not where you look); h/v = iris offset
+# inside the eye in eye widths (right/down positive); nx/ny = where the nose tip sits relative to
+# the eyes, in eye distances along/across the eye line: a head-pointing cue that does not depend on
+# how far or off-centre you sit. Signs are arbitrary (camera-dependent); calibration absorbs them.
+Face = namedtuple("Face", "yaw pitch tx ty tz h v nx ny")
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
 
 
@@ -96,6 +101,7 @@ class HeadTracker:
         )
         self.shapes = None           # {blendshape name: 0..1} of the last frame, when enabled
         self.landmarks = None
+        self.blink = None            # mean eyelid closure score 0..1 (needs blendshapes)
         self.landmarker = vision.FaceLandmarker.create_from_options(opts)
         self.min_interval = 0.8 / TRACK_FPS          # 0.8: do not skip frames to timing jitter
         self._last = 0.0
@@ -119,6 +125,8 @@ class HeadTracker:
         self.shapes = ({c.category_name: c.score for c in res.face_blendshapes[0]}
                        if res.face_blendshapes else None)
         self.landmarks = res.face_landmarks[0] if res.face_landmarks else None   # for the debug view
+        self.blink = (None if not self.shapes else
+                      (self.shapes["eyeBlinkLeft"] + self.shapes["eyeBlinkRight"]) / 2)
         if not res.facial_transformation_matrixes:
             return None, frame
         face = _face(np.array(res.facial_transformation_matrixes[0]),
@@ -140,7 +148,19 @@ def _face(m, lm, w, h):
     pitch = math.degrees(math.asin(max(-1.0, min(1.0, r[1, 2]))))
     eyes = [_eye(lm, ids, w, h) for ids in (RIGHT_EYE, LEFT_EYE)]
     hh, vv = np.mean(eyes, axis=0)
-    return Face(yaw, pitch, float(m[0, 3]), float(m[1, 3]), float(m[2, 3]), float(hh), float(vv))
+    nx, ny = _nose(lm, w, h)
+    return Face(yaw, pitch, float(m[0, 3]), float(m[1, 3]), float(m[2, 3]), float(hh), float(vv), nx, ny)
+
+
+def _nose(lm, w, h):
+    """Nose tip relative to the midpoint of the outer eye corners, in units of the eye distance."""
+    right, left, nose = (np.array([lm[i].x * w, lm[i].y * h]) for i in (RIGHT_EYE[0], LEFT_EYE[0], NOSE_TIP))
+    axis = left - right
+    dist = np.linalg.norm(axis)
+    axis /= dist
+    perp = np.array([-axis[1], axis[0]])
+    off = nose - (left + right) / 2
+    return float(off @ axis / dist), float(off @ perp / dist)
 
 
 def _eye(lm, ids, w, h):

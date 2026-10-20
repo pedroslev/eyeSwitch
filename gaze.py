@@ -4,10 +4,13 @@ Ridge regression on standardized features, linear or quadratic. The degree and t
 regularization are picked by leave-one-point-out cross-validation, which also gives an
 honest error estimate (it is pessimistic for the edge points, since they get extrapolated).
 
-Two protections against wild estimates, both found the hard way with real calibration data:
-features that carry no information (the vertical iris offset is mostly noise at webcam
-resolution) are dropped, and live inputs are clamped to the range seen during calibration, since a
-single glitchy frame fed to a quadratic can otherwise land a screen away.
+Lessons from real calibration data, each one now enforced here:
+- Features that carry no information are dropped, and the caller chooses among candidate feature
+  sets by cross-validation. Head *position* in the camera frame is not a gaze cue: its fitted
+  coefficients exploded (1 cm of seat shift moved the estimate ~1000 px), so callers leave it out.
+- Live inputs are clamped to the range seen during calibration, and `range_excess` tells when the
+  pose is far outside it (camera or chair moved), so nobody acts on a meaningless estimate.
+- The estimate is steadied with a fixation filter whose radius comes from the measured noise.
 """
 import numpy as np
 
@@ -34,41 +37,53 @@ def _ridge(a, y, alpha):
 
 
 class GazeModel:
-    def __init__(self, degree, mean, std, weights, error_px=None, active=None, lo=None, hi=None):
+    def __init__(self, degree, mean, std, weights, error_px=None, active=None, lo=None, hi=None,
+                 noise_px=None):
         self.degree, self.mean, self.std = degree, np.asarray(mean, float), np.asarray(std, float)
         self.weights, self.error_px = np.asarray(weights), error_px
         self.active = list(range(len(self.mean))) if active is None else [int(i) for i in active]
         self.lo = None if lo is None else np.asarray(lo, float)      # clamp range of the active features
         self.hi = None if hi is None else np.asarray(hi, float)
+        self.noise_px = noise_px            # scatter of the estimate while looking at one point
         self.point_errors = {}
 
+    def _z(self, vec):
+        return ((np.asarray(vec, float) - self.mean) / self.std)[self.active]
+
     def predict(self, vec):
-        z = ((np.asarray(vec, float) - self.mean) / self.std)[self.active]
+        z = self._z(vec)
         if self.lo is not None:
             z = np.clip(z, self.lo, self.hi)
         x, y = (_expand(z[None], self.degree) @ self.weights)[0]
         return float(x), float(y)
 
+    def range_excess(self, vec):
+        """How far the pose is outside the calibrated range, as a fraction of that range (0 = inside)."""
+        if self.lo is None:
+            return 0.0
+        z, span = self._z(vec), np.maximum(self.hi - self.lo, 1e-9)
+        return float(np.max(np.maximum(np.maximum(z - self.hi, self.lo - z), 0) / span))
+
     def to_dict(self):
         return {"degree": self.degree, "mean": self.mean.tolist(), "std": self.std.tolist(),
                 "weights": self.weights.tolist(), "error_px": self.error_px, "active": self.active,
                 "lo": None if self.lo is None else self.lo.tolist(),
-                "hi": None if self.hi is None else self.hi.tolist()}
+                "hi": None if self.hi is None else self.hi.tolist(), "noise_px": self.noise_px}
 
     @classmethod
     def from_dict(cls, d):
         return cls(d["degree"], d["mean"], d["std"], d["weights"], d.get("error_px"),
-                   d.get("active"), d.get("lo"), d.get("hi"))
+                   d.get("active"), d.get("lo"), d.get("hi"), d.get("noise_px"))
 
 
-def _informative(z, groups):
-    """Indices of the features that change between calibration points more than within one."""
+def _informative(z, groups, cols):
+    """The columns among `cols` that change between calibration points more than within one."""
     ids = np.unique(groups)
-    between = np.array([z[groups == g].mean(axis=0) for g in ids]).std(axis=0)
-    within = np.array([z[groups == g].std(axis=0) for g in ids]).mean(axis=0)
+    between = np.array([z[groups == g][:, cols].mean(axis=0) for g in ids]).std(axis=0)
+    within = np.array([z[groups == g][:, cols].std(axis=0) for g in ids]).mean(axis=0)
     snr = between / np.maximum(within, 1e-9)
-    active = [int(i) for i in np.where(snr >= MIN_SNR)[0]]
-    return active if len(active) >= 2 else sorted(int(i) for i in np.argsort(-snr)[:2])
+    keep = [cols[i] for i in np.where(snr >= MIN_SNR)[0]]
+    return keep if len(keep) >= 2 else sorted(cols[i] for i in np.argsort(-snr)[:2])
 
 
 def _trim_outliers(z, groups):
@@ -81,13 +96,9 @@ def _trim_outliers(z, groups):
     return keep
 
 
-def fit(features, targets, groups):
-    """features (N, F), targets (N, 2) desktop pixels, groups (N,) calibration point ids."""
-    x, y, groups = np.asarray(features, float), np.asarray(targets, float), np.asarray(groups)
-    mean, std = x.mean(axis=0), x.std(axis=0)
-    std[std < 1e-9] = 1.0
-    z_all = (x - mean) / std
-    active = _informative(z_all, groups)
+def _fit_columns(z_all, y, groups, cols, mean, std):
+    """Best model that uses only (informative) `cols`."""
+    active = _informative(z_all, groups, cols)
     z = z_all[:, active]
     keep = _trim_outliers(z, groups)
     z, y, groups = z[keep], y[keep], groups[keep]
@@ -115,7 +126,27 @@ def fit(features, targets, groups):
     model = GazeModel(degree, mean, std, weights, rms, active,
                       lo - CLAMP_MARGIN * span, hi + CLAMP_MARGIN * span)
     model.point_errors = per_point                  # leave-one-point-out error per calibration point, px
+
+    guess = _expand(z, degree) @ weights            # how much the estimate wobbles while looking at one point
+    spread = [guess[groups == g] - np.median(guess[groups == g], axis=0) for g in np.unique(groups)]
+    model.noise_px = float(np.sqrt((np.concatenate(spread) ** 2).sum(axis=1).mean()))
     return model
+
+
+def fit(features, targets, groups, column_sets=None):
+    """features (N, F), targets (N, 2) desktop pixels, groups (N,) calibration point ids.
+
+    `column_sets` are candidate feature subsets (lists of column indices); the one that
+    cross-validates best wins, with a preference for fewer columns when it is a near tie.
+    """
+    x, y, groups = np.asarray(features, float), np.asarray(targets, float), np.asarray(groups)
+    column_sets = column_sets or [list(range(x.shape[1]))]
+    mean, std = x.mean(axis=0), x.std(axis=0)
+    std[std < 1e-9] = 1.0
+    z_all = (x - mean) / std
+    models = [_fit_columns(z_all, y, groups, list(cols), mean, std) for cols in column_sets]
+    limit = min(m.error_px for m in models) * SIMPLICITY
+    return min((m for m in models if m.error_px <= limit), key=lambda m: (len(m.active), m.error_px))
 
 
 class Smoother:
@@ -136,3 +167,41 @@ class Smoother:
         else:
             self.point = tuple(p + self.factor * (n - p) for p, n in zip(self.point, med))
         return self.point
+
+
+class FixationFilter:
+    """Holds the estimate still while you fixate; moves only when you look somewhere else.
+
+    The output is the median of the recent points inside `radius` of the current fixation. A point
+    outside the radius does not move it until `confirm` consecutive points agree on a new place
+    (so a blink or a glitch cannot). On real data this beat a median+EMA filter on both counts:
+    less jitter (44 vs 52 px) and less lag (276 vs 414 ms). Resets after a gap in the data.
+    """
+
+    def __init__(self, radius=200.0, confirm=4, keep=8):
+        self.radius, self.confirm, self.keep = radius, confirm, keep
+        self.reset()
+
+    def reset(self):
+        self.center, self.buffer, self.pending = None, [], []
+
+    def update(self, point):
+        if point is None:
+            self.reset()
+            return None
+        p = np.asarray(point, float)
+        if self.center is None:
+            self.center, self.buffer = p, [p]
+        elif np.hypot(*(p - self.center)) <= self.radius:
+            self.buffer = (self.buffer + [p])[-self.keep:]
+            self.pending = []
+            self.center = np.median(self.buffer, axis=0)
+        else:
+            self.pending.append(p)
+            if len(self.pending) >= self.confirm:
+                new = np.median(self.pending, axis=0)
+                if all(np.hypot(*(q - new)) <= self.radius for q in self.pending):   # a consistent new place
+                    self.center, self.buffer, self.pending = new, list(self.pending), []
+                else:
+                    self.pending = self.pending[1:]
+        return float(self.center[0]), float(self.center[1])

@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from gaze import GazeModel, Smoother, fit  # noqa: E402
+from gaze import FixationFilter, GazeModel, Smoother, fit  # noqa: E402
 
 GRID = [(fx, fy) for fy in (0.08, 0.5, 0.92) for fx in (0.08, 0.5, 0.92)]
 SCREEN = (3840, 1080)
@@ -93,6 +93,18 @@ class GazeTest(unittest.TestCase):
             beyond = max(0.0, value - col.max(), col.min() - value)
             self.assertLess(beyond, 0.5 * np.ptp(col))
 
+    def test_chooses_among_feature_sets_and_never_uses_noise_columns(self):
+        x, y, g = synthetic(noise=0.3, seed=6)                 # columns 2, 3, 4 are pure noise
+        model = fit(x, y, g, column_sets=[[0, 1, 5, 6], [0, 1, 2, 3, 4, 5, 6]])
+        self.assertTrue(set(model.active) <= {0, 1, 5, 6})
+
+    def test_reports_the_measured_noise_and_how_far_out_of_range_a_pose_is(self):
+        x, y, g = synthetic(noise=0.3, seed=2)
+        model = fit(x, y, g)
+        self.assertGreater(model.noise_px, 0)
+        self.assertEqual(model.range_excess(x[0]), 0.0)
+        self.assertGreater(model.range_excess(x[0] + 100), 0.5)
+
     def test_roundtrip_dict(self):
         x, y, g = synthetic(noise=0.2)
         model = fit(x, y, g)
@@ -114,6 +126,37 @@ class GazeTest(unittest.TestCase):
         self.assertEqual(s.update((10.0, 20.0)), (5.0, 10.0))
         self.assertIsNone(s.update(None))
         self.assertEqual(s.update((8.0, 8.0)), (8.0, 8.0))
+
+
+class FixationFilterTest(unittest.TestCase):
+    def test_holds_still_while_the_estimate_only_jitters(self):
+        f = FixationFilter(radius=100, confirm=3)
+        rng = np.random.default_rng(1)
+        out = np.array([f.update((500 + rng.normal(0, 30), 400 + rng.normal(0, 30))) for _ in range(60)])
+        self.assertLess(out[5:].std(axis=0).max(), 12)                       # raw scatter is 30
+
+    def test_moves_once_enough_points_agree_on_a_new_place(self):
+        f = FixationFilter(radius=100, confirm=3)
+        for _ in range(5):
+            f.update((0, 0))
+        out = [f.update((1000, 0)) for _ in range(3)]
+        self.assertEqual(out[:2], [(0.0, 0.0), (0.0, 0.0)])
+        self.assertAlmostEqual(out[2][0], 1000)
+
+    def test_ignores_a_glitch_and_a_wandering_burst(self):
+        f = FixationFilter(radius=100, confirm=3)
+        for _ in range(5):
+            f.update((0, 0))
+        self.assertEqual(f.update((2000, 900)), (0.0, 0.0))                  # one wild point
+        self.assertEqual(f.update((0, 0)), (0.0, 0.0))
+        for p in ((900, 0), (0, 900), (-900, 0)):                            # points that disagree
+            self.assertEqual(f.update(p), (0.0, 0.0))
+
+    def test_resets_after_a_gap(self):
+        f = FixationFilter()
+        f.update((10, 10))
+        self.assertIsNone(f.update(None))
+        self.assertEqual(f.update((700, 300)), (700.0, 300.0))
 
 
 if __name__ == "__main__":

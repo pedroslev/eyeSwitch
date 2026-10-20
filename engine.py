@@ -14,9 +14,10 @@ import preview
 import virtualcam
 from backends.base import parse_keys
 from camwatch import CameraWatcher
-from gaze import GazeModel, Smoother
+from gaze import FixationFilter, GazeModel
 from gestures import Detector, GestureModel
-from tracker import HeadTracker
+from samples import PAD_AFTER, BlinkDetector, clean_capture
+from tracker import Face, HeadTracker
 
 CONFIG_DIR = backends.config_dir()
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -31,6 +32,7 @@ DEFAULTS = {
     "show_gaze": False,         # draw the estimated gaze point (for testing)
     "virtual_camera": False,    # Linux: republish the camera as "eyeSwitch Camera" for video calls
     "calibration_preview": True,  # show the camera view in a corner while calibrating
+    "stability": 3,             # window mode, 1..5: how steady the gaze point is (higher = steadier, slower)
     "edge_px": 0,               # window mode: stay on the active window within this many px of it (0 = auto)
     "gestures": {               # facial gestures that press keys; bindings come from the Gestures dialog
         "enabled": False,
@@ -46,6 +48,15 @@ FAR_FACTOR = 1.5        # ignore poses farther than this many spacings from ever
 EDGE_MARGIN = 0.04      # gaze must be this far (monitor widths) inside a monitor to move there
 WINDOW_POLL = 0.1       # seconds between "which window is under the gaze" lookups
 RETRY = 4.0             # seconds of calm before taking the camera back from another app
+RANGE_LIMIT = 0.5       # pose this far outside the calibrated range (fraction of it): do not act on it
+
+# Candidate feature sets for the gaze model; the one that cross-validates best wins. Head position
+# (tx, ty, tz) is deliberately absent: it says where you sit, not where you look, and a model fitted
+# with it moved the estimate ~1000 px per cm of seat shift while being less accurate.
+_F = Face._fields
+GAZE_COLUMN_SETS = [[_F.index(n) for n in names] for names in (
+    ("yaw", "pitch", "h", "v"), ("yaw", "pitch", "h", "v", "nx", "ny"))]
+STABILITY = {1: (2, 0.8), 2: (3, 0.9), 3: (4, 1.0), 4: (5, 1.1), 5: (6, 1.25)}   # level -> (confirm frames, radius x)
 
 
 def load_config():
@@ -145,7 +156,7 @@ class Camera:
     def _wanted(self):
         cfg = self.engine.cfg
         return (cfg["camera"], bool(cfg["virtual_camera"]) and virtualcam.AVAILABLE, cfg["mode"] == "window",
-                self.engine.want_shapes or bool(self.engine.active_gestures()))
+                self.engine.want_shapes or bool(self.engine.active_gestures()) or cfg["mode"] == "window")
 
     def _watch(self, cam):
         path = f"/dev/video{cam}"
@@ -250,6 +261,10 @@ class Engine:
         self.shapes_seen = 0.0          # monotonic time of the last frame that carried blendshapes
         self.preview = None             # latest debug image (BGR array), rendered while preview_wanted > 0
         self.preview_wanted = 0         # how many views want it (the window, a calibration)
+        self.blinking = False           # eyelids closing right now (or just reopened): estimate is held
+        self.out_of_range = False       # pose is far outside what was calibrated (camera or seat moved)
+        self.stale_model = False        # a saved gaze model from an older tracker: recalibrate
+        self.last_capture = {}          # stats of the last capture: frames kept, blinks and motion dropped
         self.calibrating = False
         self.on_change = None           # called from the worker thread when `enabled` flips
         self.monitors = backends.Session().monitors()
@@ -268,7 +283,11 @@ class Engine:
                 data = json.load(f)
             self.centers, self.calib_monitors = data["yaw"], data["monitors"]
             if data.get("gaze"):
-                self.gaze_model = GazeModel.from_dict(data["gaze"])
+                model = GazeModel.from_dict(data["gaze"])
+                if len(model.mean) == len(Face._fields):
+                    self.gaze_model = model
+                else:
+                    self.stale_model = True      # fitted on other features: its numbers mean nothing now
         except (FileNotFoundError, ValueError, KeyError):
             pass
 
@@ -284,6 +303,7 @@ class Engine:
     def set_calibration(self, yaws, monitors, model=None):
         """Store per-monitor head yaws; `model` is the gaze model of a full calibration."""
         self.centers, self.calib_monitors, self.gaze_model = list(yaws), [list(m) for m in monitors], model
+        self.stale_model = False
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CALIB_PATH, "w") as f:
             json.dump({"monitors": self.calib_monitors, "yaw": self.centers,
@@ -294,10 +314,18 @@ class Engine:
             self._capture = []
 
     def end_capture(self):
-        """Faces seen since begin_capture()."""
+        """Faces worth keeping since begin_capture(): blinks (with padding) and frames where the head
+        is still travelling are dropped. `last_capture` says how many went."""
         with self._lock:
-            samples, self._capture = self._capture or [], None
-        return samples
+            records, self._capture = self._capture or [], None
+        faces, self.last_capture = clean_capture(records)
+        return faces
+
+    def capture_clean_count(self):
+        """How many clean frames the capture in progress has so far (blinks and motion excluded)."""
+        with self._lock:
+            records = list(self._capture or [])
+        return len(clean_capture(records)[0])
 
     def begin_shape_capture(self):
         with self._lock:
@@ -313,10 +341,14 @@ class Engine:
         lines = [self.status, f"{frame.shape[1]}x{frame.shape[0]}"]
         if face is not None:
             lines += [f"yaw {face.yaw:+6.1f}   pitch {face.pitch:+6.1f}",
-                      f"iris h {face.h:+.3f}   v {face.v:+.3f}",
+                      f"iris h {face.h:+.3f}   v {face.v:+.3f}   nose {face.nx:+.2f} {face.ny:+.2f}",
                       f"head x{face.tx:+.0f} y{face.ty:+.0f} z{face.tz:+.0f} cm"]
         if self.gaze:
             lines.append(f"gaze {self.gaze[0]:.0f}, {self.gaze[1]:.0f}")
+        if self.blinking:
+            lines.append("BLINK: estimate held")
+        if self.out_of_range:
+            lines.append("OUT OF CALIBRATED RANGE")
         return preview.render(frame, tracker.landmarks, lines)
 
     # --- gestures ----------------------------------------------------------
@@ -375,7 +407,9 @@ class Engine:
         px, py = xs.pointer()
         current = xs.monitor_at(self.monitors, px, py) or 0
         mouse_time, smooth, cand, cand_since = 0.0, None, None, 0.0
-        gaze_filter, win_checked, win_under, active_bounds = Smoother(window=5), 0.0, None, None
+        gaze_filter, filter_key = FixationFilter(), None
+        win_checked, win_under, active_bounds = 0.0, None, None
+        blink_detector, blink_until = BlinkDetector(), 0.0
         suppress_until, gesture_state = 0.0, (-1, [])      # (version, [(binding, model, detector)])
 
         while not self._stop.is_set():
@@ -440,9 +474,13 @@ class Engine:
                 continue
             if camera.tracker.shapes:
                 self.shapes_seen = now
+            flagged = blink_detector.update(camera.tracker.blink)
+            if flagged:
+                blink_until = now + PAD_AFTER          # the lids reopening still distort the estimate
+            blinking = self.blinking = now < blink_until
             with self._lock:
                 if self._capture is not None:
-                    self._capture.append(face)
+                    self._capture.append((now, face, flagged))
                 if self._shape_capture is not None and camera.tracker.shapes:
                     self._shape_capture.append(dict(camera.tracker.shapes))
             smooth = face.yaw if smooth is None else smooth + SMOOTH * (face.yaw - smooth)
@@ -451,9 +489,22 @@ class Engine:
             # Where on the desktop are you looking (window mode, or to click where you look).
             calibrated = self.calibrated
             click_wanted = any(b.get("action") == "click" for b, _, _ in detectors)
+            self.out_of_range = False
             if calibrated and self.gaze_model is not None and (window_mode or click_wanted):
-                g = gaze_filter.update(self.gaze_model.predict(np.asarray(face, float)))
-                self.gaze = clamp_to_monitors(g[0], g[1], monitors)
+                model, vec = self.gaze_model, np.asarray(face, float)
+                level = min(max(int(self.cfg.get("stability", 3)), 1), 5)
+                if filter_key != (id(model), level):                 # new model or setting: new filter
+                    confirm, factor = STABILITY[level]
+                    radius = min(max(2.2 * (model.noise_px or 90.0) * factor, 100.0), 320.0)
+                    gaze_filter, filter_key = FixationFilter(radius, confirm), (id(model), level)
+                if model.range_excess(vec) > RANGE_LIMIT:
+                    self.out_of_range, self.gaze = True, None
+                    gaze_filter.update(None)
+                elif blinking and self.gaze is not None:
+                    pass                                             # hold the estimate through a blink
+                else:
+                    g = gaze_filter.update(model.predict(vec))
+                    self.gaze = clamp_to_monitors(g[0], g[1], monitors)
             else:
                 self.gaze = None
                 gaze_filter.update(None)
@@ -476,6 +527,13 @@ class Engine:
 
             if window_mode:
                 # --- gaze: which monitor and which window are you looking at -------------------
+                if self.gaze is None:
+                    self.status = ("Outside the calibrated range: did the camera or your seat move? "
+                                   "Recalibrate" if self.out_of_range else "No gaze estimate")
+                    cand = None
+                    continue
+                if blinking:
+                    continue                                         # decisions wait until the eyes reopen
                 gx, gy = self.gaze
                 mon = gaze_monitor(gx, gy, monitors, current)
                 if now - win_checked >= WINDOW_POLL:

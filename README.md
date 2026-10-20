@@ -74,12 +74,39 @@ noise at webcam resolution) are dropped automatically, and live inputs are clamp
 while calibrating; a median over the last 5 frames removes one-frame spikes. While you calibrate the
 test dot is hidden, since it would still show the previous calibration.
 
+### How the gaze estimate is made (and why)
+
+Window mode fits, from your calibration, a mapping from **head pose (yaw, pitch), where the nose sits
+relative to the eyes, and the iris offset inside each eye** to a point on the desktop. Head pointing
+carries most of the signal (at webcam resolution an eye is only a few dozen pixels wide), the irises
+refine it. Things learned the hard way with real calibration data, all covered by tests:
+
+- **Head position in the camera frame (where you sit) is not used.** A model fitted with it moved the
+  estimate about 1000 px per centimetre of seat shift, and was less accurate on new dots too.
+- **Blinks** are detected from the face tracker's eyelid scores against your own open-eye level and are
+  dropped from calibration with a margin (the signals stay off ~0.4 s after the lids reopen); a dot that
+  ends up with too few clean frames keeps being sampled for up to 3 s. In use, the estimate is held
+  through a blink.
+- **Frames where the head is still travelling** between dots are dropped, and the dots come in
+  **random order**, because in a fixed sweep where the head points for a given dot depends on where
+  it came from (about 5 degrees of yaw in real data).
+- **Two feature sets compete** (head pose and iris, with and without the nose); cross-validation picks
+  one, preferring the smaller on a tie. Features without information are dropped, inputs are clamped to
+  the calibrated range, and if your pose leaves that range (the camera or your chair moved) eyeSwitch
+  says so and does nothing instead of acting on a meaningless estimate.
+- **The output is steadied with a fixation filter** (the I-DT idea from eye tracking): while you fixate,
+  the point stays put, and it moves once several consecutive frames agree on a new place. Its radius
+  comes from the noise measured during your calibration. It beat a median+EMA filter on both jitter and
+  lag on real data.
+- **Calibration is tied to where the camera sits.** Move the camera and recalibrate.
+
 In this mode the camera runs at 720p, because at 640x480 an eye is only ~20 px wide. It works best with big windows and a steady seat;
 redo the full calibration when you move the camera or change your posture a lot.
 The quick calibration discards a previous gaze model, since both describe the same setup.
 
 Settings: camera, mode, delay before switching monitor (default 300 ms), delay before focusing a
-window (500 ms), window edge tolerance (keeps the focus on the active window while your gaze is within
+window (500 ms), steadiness 1-5 (how firmly the gaze point is held still; higher is steadier and a little slower),
+window edge tolerance (keeps the focus on the active window while your gaze is within
 this distance of it, `auto` follows the gaze error; raise it if focus flickers between two windows), wait after typing (2 s: window mode never changes focus inside a monitor while you
 are typing), start at login. Ctrl+Shift+G pauses and resumes; while paused the camera is released.
 Nothing happens while you are using the mouse (and for 1.5 s after), and glances shorter than the
@@ -145,7 +172,9 @@ cannot use it. What eyeSwitch does about it:
   the camera as a virtual one (pyvirtualcam, v4l2loopback).
 - `gaze.py`: ridge regression from those features to a desktop point, degree and regularization
   chosen by leave-one-point-out cross-validation (this is also the error estimate); the simplest
-  model within 5% of the best wins, since complex ones overshoot at the screen edges.
+  model within 5% of the best wins, since complex ones overshoot at the screen edges. Also the
+  fixation filter that steadies the output.
+- `samples.py`: blink detection and cleaning of calibration captures (blinks, head in motion).
 - `preview.py`: draws the camera debug view.
 - `gestures.py`: trains a gesture from blendshapes (linear discriminant) and detects it live.
 - `backends/`: one module per OS behind the same interface (`base.py`): monitors, pointer,

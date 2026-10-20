@@ -7,12 +7,12 @@ from types import SimpleNamespace
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from tracker import LEFT_EYE, RIGHT_EYE, _face  # noqa: E402
+from tracker import LEFT_EYE, NOSE_TIP, RIGHT_EYE, _face  # noqa: E402
 
 W, H = 640, 480
 
 
-def landmarks(iris_dx=0.0, iris_dy=0.0):
+def landmarks(iris_dx=0.0, iris_dy=0.0, nose=(0.5, 0.58)):
     """478 landmarks; both eyes 0.06 wide, irises offset from the eye centers."""
     lm = [SimpleNamespace(x=0.5, y=0.5, z=0.0) for _ in range(478)]
 
@@ -24,6 +24,7 @@ def landmarks(iris_dx=0.0, iris_dy=0.0):
     put(o, 0.40, 0.50), put(n, 0.46, 0.50), put(iris, 0.43 + iris_dx, 0.50 + iris_dy)
     o, n, iris = LEFT_EYE
     put(o, 0.60, 0.50), put(n, 0.54, 0.50), put(iris, 0.57 + iris_dx, 0.50 + iris_dy)
+    put(NOSE_TIP, *nose)
     return lm
 
 
@@ -54,6 +55,20 @@ class FaceTest(unittest.TestCase):
     def test_looking_down_is_positive_v(self):
         f = _face(matrix(), landmarks(iris_dy=+0.005), W, H)
         self.assertGreater(f.v, 0)
+
+    def test_nose_offset_is_in_eye_distances_and_ignores_distance_and_roll(self):
+        f = _face(matrix(), landmarks(nose=(0.50, 0.58)), W, H)
+        self.assertAlmostEqual(f.nx, 0.0, places=3)
+        self.assertGreater(f.ny, 0)                                       # nose below the eyes
+        turned = _face(matrix(), landmarks(nose=(0.53, 0.58)), W, H)      # nose towards image right
+        self.assertAlmostEqual(turned.nx - f.nx, 0.03 * W / (0.20 * W), places=3)
+        # the same face twice as far away (everything scaled about the image centre): same nx/ny
+        far = landmarks(nose=(0.53, 0.58))
+        for p in far:
+            p.x, p.y = 0.5 + (p.x - 0.5) / 2, 0.5 + (p.y - 0.5) / 2
+        again = _face(matrix(), far, W, H)
+        self.assertAlmostEqual(again.nx, turned.nx, places=3)
+        self.assertAlmostEqual(again.ny, turned.ny, places=3)
 
     def test_yaw_and_scale(self):
         self.assertAlmostEqual(_face(matrix(25), landmarks(), W, H).yaw, 25, places=3)
