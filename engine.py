@@ -2,12 +2,15 @@
 import json
 import math
 import os
+import sys
 import threading
 import time
 
 import numpy as np
 
 import backends
+import virtualcam
+from camwatch import CameraWatcher
 from gaze import GazeModel, Smoother
 from tracker import HeadTracker
 
@@ -22,6 +25,7 @@ DEFAULTS = {
     "window_delay_ms": 500,     # looking at another window of the same monitor this long focuses it
     "typing_wait_s": 2.0,       # window mode: no same-monitor window changes this soon after typing
     "show_gaze": False,         # draw the estimated gaze point (for testing)
+    "virtual_camera": False,    # Linux: republish the camera as "eyeSwitch Camera" for video calls
 }
 
 SMOOTH = 0.4            # EMA factor for the yaw signal
@@ -30,6 +34,7 @@ MOUSE_QUIET = 1.5       # seconds without touching the mouse before we act
 FAR_FACTOR = 1.5        # ignore poses farther than this many spacings from every monitor
 EDGE_MARGIN = 0.04      # gaze must be this far (monitor widths) inside a monitor to move there
 WINDOW_POLL = 0.1       # seconds between "which window is under the gaze" lookups
+RETRY = 4.0             # seconds of calm before taking the camera back from another app
 
 
 def load_config():
@@ -89,12 +94,119 @@ def switch(xs, monitors, idx, last_window, last_pointer, wid=None):
         xs.activate(wid)
 
 
+class Camera:
+    """The webcam, its optional virtual copy, and a watcher that notices other apps wanting it.
+
+    A webcam can be streamed by one process only. When another app opens the device we let go
+    (it will usually fail once, then work) and take it back after RETRY seconds without news.
+    With the virtual camera on, calls use "eyeSwitch Camera" instead and nothing is shared at all.
+    """
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.tracker = self.vcam = self.watcher = self.key = None
+        self.yielded, self.retry_at = False, 0.0
+
+    def _wanted(self):
+        cfg = self.engine.cfg
+        return (cfg["camera"], bool(cfg["virtual_camera"]) and virtualcam.AVAILABLE, cfg["mode"] == "window")
+
+    def _watch(self, cam):
+        path = f"/dev/video{cam}"
+        if self.watcher and self.watcher.path == path:
+            return
+        self._stop_watcher()
+        if sys.platform.startswith("linux"):
+            try:
+                self.watcher = CameraWatcher(path)
+            except OSError:
+                self.watcher = None
+
+    def _stop_watcher(self):
+        if self.watcher:
+            self.watcher.stop()
+            self.watcher = None
+
+    def _close(self):
+        if self.tracker:
+            self.tracker.close()
+        if self.vcam:
+            self.vcam.close()
+        self.tracker = self.vcam = self.key = None
+
+    def release(self):
+        """Let go of everything (paused, or quitting)."""
+        self._close()
+        self._stop_watcher()
+        self.yielded = False
+        self.engine.vcam_state = "off"
+
+    def fail(self, message):
+        """The camera stopped working: show why and reopen on the next ensure()."""
+        self._close()
+        self.engine.status = message
+        time.sleep(1.0)
+
+    def ensure(self):
+        """Open the camera unless we are stepping aside. True when frames can be read."""
+        e, now, key = self.engine, time.monotonic(), self._wanted()
+        if self.tracker and self.key != key:              # settings changed
+            self._close()
+        self._watch(key[0])
+        if self.watcher and self.watcher.foreign_open.is_set():
+            self.watcher.foreign_open.clear()
+            if self.tracker:                              # someone else wants it: step aside
+                self._close()
+                self.yielded = True
+            if self.yielded:
+                self.retry_at = now + RETRY
+        if self.tracker:
+            return True
+        if self.yielded and now < self.retry_at:
+            e.status = "Camera in use by another app: waiting for it"
+            time.sleep(0.1)
+            return False
+        return self._open(key, now)
+
+    def _open(self, key, now):
+        e, (cam, want_vcam, hires) = self.engine, key
+        if self.watcher:
+            self.watcher.ignore_for(2.0)                  # the opens below are ours
+        sink, e.vcam_state = None, "off"
+        if want_vcam:
+            device = virtualcam.find_device()
+            if device is None:
+                e.vcam_state = "not set up"
+            else:
+                try:
+                    self.vcam = virtualcam.VirtualCamera(device)
+                    sink, e.vcam_state = self.vcam.send, "active"
+                except Exception as ex:
+                    e.vcam_state = f"error: {ex}"
+        try:
+            self.tracker, self.key, self.yielded = HeadTracker(cam, sink, hires), key, False
+            return True
+        except Exception as ex:
+            if self.vcam:
+                self.vcam.close()
+                self.vcam = None
+            if self.yielded:                              # still busy: keep waiting
+                self.retry_at = now + RETRY
+                e.status = "Camera in use by another app: waiting for it"
+                time.sleep(0.1)
+            else:
+                e.status = f"Camera error: {ex}"
+                time.sleep(1.0)
+            return False
+
+
 class Engine:
     def __init__(self, cfg):
         self.cfg = cfg
         self.status = "Starting..."
         self.yaw = None                 # smoothed head yaw in degrees, None when no face
         self.gaze = None                # smoothed gaze point in desktop pixels (window mode)
+        self.vcam_state = "off"         # off / active / not set up / error: ...
         self.calibrating = False
         self.on_change = None           # called from the worker thread when `enabled` flips
         self.monitors = backends.Session().monitors()
@@ -163,7 +275,7 @@ class Engine:
         except Exception as e:
             self.status = f"Cannot start the {backends.platform_name()} backend: {e}"
             return
-        tracker, opened = None, None
+        camera = Camera(self)
         last_window, last_pointer = {}, {}
         px, py = xs.pointer()
         current = xs.monitor_at(self.monitors, px, py) or 0
@@ -174,9 +286,7 @@ class Engine:
             if hotkey_ok and xs.hotkey_pressed():
                 self.set_enabled(not self.cfg["enabled"])
             if not (self.cfg["enabled"] or self.calibrating):
-                if tracker:                       # release the camera while paused
-                    tracker.close()
-                    tracker, opened = None, None
+                camera.release()                  # let other apps have the camera while paused
                 self.yaw = self.gaze = None
                 smooth, cand = None, None
                 gaze_filter.update(None)
@@ -184,25 +294,15 @@ class Engine:
                 time.sleep(0.1)
                 continue
 
-            cam = self.cfg["camera"]
-            if tracker is None or opened != cam:
-                if tracker:
-                    tracker.close()
-                    tracker = None
-                try:
-                    tracker, opened = HeadTracker(cam), cam
-                except Exception as e:
-                    self.status = f"Camera error: {e}"
-                    time.sleep(1.0)
-                    continue
-
+            if not camera.ensure():
+                continue
             try:
-                face, _ = tracker.read()
+                face, frame = camera.tracker.read()
             except Exception as e:                # show it instead of silently killing the thread
-                self.status = f"Tracking error: {e}"
-                tracker.close()
-                tracker, opened = None, None
-                time.sleep(1.0)
+                camera.fail(f"Tracking error: {e}")
+                continue
+            if frame is None:
+                camera.fail("Camera error: no frames (is another app using it?)")
                 continue
             now = time.monotonic()
             monitors = self.monitors = xs.monitors()
@@ -288,5 +388,4 @@ class Engine:
                 current, cand = target, None
                 px, py = xs.pointer()             # our own warp is not mouse activity
 
-        if tracker:
-            tracker.close()
+        camera.release()

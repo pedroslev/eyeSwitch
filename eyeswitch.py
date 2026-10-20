@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBo
 import autostart  # noqa: E402
 import backends  # noqa: E402
 import gaze  # noqa: E402
+import virtualcam  # noqa: E402
 from engine import Engine, load_config, nearest_monitor, save_config  # noqa: E402
 from tracker import list_cameras  # noqa: E402
 
@@ -314,6 +315,16 @@ class MainWindow(QWidget):
         self.show_gaze.setChecked(cfg["show_gaze"])
         self.show_gaze.toggled.connect(self._on_show_gaze)
 
+        self.vcam = QCheckBox("Share the camera with video calls (virtual camera)")
+        self.vcam.setChecked(cfg["virtual_camera"])
+        self.vcam.toggled.connect(lambda on: self._set("virtual_camera", on))
+        self.vcam.setVisible(virtualcam.AVAILABLE)
+        self.vcam_note = QLabel()
+        self.vcam_note.setWordWrap(True)
+        self.vcam_note.setEnabled(False)
+        self.vcam_note.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.vcam_note.setVisible(virtualcam.AVAILABLE)
+
         self.autostart = QCheckBox("Start at login")
         self.autostart.setChecked(autostart.is_enabled())
         self.autostart.toggled.connect(autostart.set_enabled)
@@ -340,6 +351,8 @@ class MainWindow(QWidget):
             layout.addWidget(w)
         layout.addLayout(self.form)
         layout.addWidget(self.show_gaze)
+        layout.addWidget(self.vcam)
+        layout.addWidget(self.vcam_note)
         layout.addWidget(self.autostart)
         buttons = QHBoxLayout()
         buttons.addWidget(self.quick_btn)
@@ -401,6 +414,22 @@ class MainWindow(QWidget):
             text = "Monitor-only mode needs just the quick calibration. The full one is for window mode."
         self.note.setText(text)
 
+    def _update_vcam_note(self):
+        if not virtualcam.AVAILABLE:
+            return
+        state = self.engine.vcam_state
+        if not self.cfg["virtual_camera"]:
+            text = ("Without it, eyeSwitch lets go of the camera when another app opens it and takes it "
+                    "back afterwards. With it, calls and eyeSwitch work at the same time.")
+        elif state == "active":
+            text = "In your video call app, choose the camera named \u201c" + virtualcam.LABEL + "\u201d."
+        elif state == "not set up":
+            text = ("One-time setup needed. Run this in a terminal:\n"
+                    f"bash {os.path.join(HERE, 'scripts', 'setup-virtual-camera.sh')}")
+        else:
+            text = f"Virtual camera: {state}"
+        self.vcam_note.setText(text)
+
     def refresh(self):
         e = self.engine
         self.status.setText(e.status)
@@ -415,6 +444,7 @@ class MainWindow(QWidget):
         yaw = "no face" if e.yaw is None else f"{e.yaw:+.1f}°"
         self.detail.setText(f"Head yaw: {yaw}  |  {cal}")
         self._update_note()
+        self._update_vcam_note()
 
     def _move_dot(self):
         want = self.cfg["mode"] == "window" and self.cfg["show_gaze"] and self.engine.gaze is not None

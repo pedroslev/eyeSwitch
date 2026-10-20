@@ -59,7 +59,7 @@ this folder or change Python environments. To run without installing: `python ey
 Window mode estimates where on the desktop you are looking from your head pose and the position
 of your irises. The full calibration fits that model and reports its estimated error (about 5% of a
 monitor width is typical for a webcam). Tick **Show where it thinks I am looking** to see the
-estimate as a red dot while you tune it. It works best with big windows and a steady seat;
+estimate as a red dot while you tune it. In this mode the camera runs at 720p, because at 640x480 an eye is only ~20 px wide. It works best with big windows and a steady seat;
 redo the full calibration when you move the camera or change your posture a lot.
 The quick calibration discards a previous gaze model, since both describe the same setup.
 
@@ -72,10 +72,36 @@ delay are ignored. Recalibrate when you move the webcam or the monitors.
 Settings and calibration live in `~/.config/eyeswitch/` (Linux),
 `%APPDATA%\eyeSwitch` (Windows) or `~/Library/Application Support/eyeSwitch` (macOS).
 
+## Video calls (sharing the camera)
+
+A webcam can be streamed by one program at a time, so while eyeSwitch is running other apps
+cannot use it. What eyeSwitch does about it:
+
+- **macOS** shares cameras natively, nothing to do. **Windows** normally shares them through its
+  camera frame server (not tested yet).
+- **Linux, automatic:** when another app opens the camera, eyeSwitch lets go of it and takes it
+  back a few seconds after the other app is done. The call app may fail on its very first attempt
+  (it already opened the device before we could react): just retry. While it waits, eyeSwitch
+  shows "Camera in use by another app". Pausing (Ctrl+Shift+G) also releases the camera at once.
+- **Linux, virtual camera (recommended if you take calls with eyeSwitch on):** eyeSwitch keeps the
+  real camera and republishes it as **"eyeSwitch Camera"**, so a call and eyeSwitch work at the
+  same time and nothing is ever contended. One-time setup (needs sudo, loads the
+  [v4l2loopback](https://github.com/umlaeute/v4l2loopback) kernel module):
+
+  ```bash
+  bash scripts/setup-virtual-camera.sh
+  ```
+
+  Then tick **Share the camera with video calls** and choose "eyeSwitch Camera" in Zoom, Meet or
+  Teams. The virtual camera needs eyeSwitch to be running and active (when paused, the real camera
+  is free again: pick it directly). If Secure Boot is on, the module has to be signed.
+
 ## How it works
 
 - `tracker.py`: MediaPipe Face Landmarker (~15 fps, 640x480): head yaw/pitch/position from the face
   transform matrix, iris position from the landmarks.
+- `camwatch.py` / `virtualcam.py`: step aside when another app opens the camera (inotify); republish
+  the camera as a virtual one (pyvirtualcam, v4l2loopback).
 - `gaze.py`: ridge regression from those features to a desktop point, degree and regularization
   chosen by leave-one-point-out cross-validation (this is also the error estimate).
 - `backends/`: one module per OS behind the same interface (`base.py`): monitors, pointer,
@@ -93,8 +119,8 @@ Everything runs locally; frames are never stored.
 python -m unittest discover tests
 ```
 
-They cover the gaze fit, the face feature geometry, and the engine decisions (fake camera and fake
-OS backend). Nothing in them touches your camera or your settings.
+They cover the gaze fit, the face feature geometry, and the engine decisions, including camera
+sharing (fake camera, fake OS backend). Nothing in them touches your camera or your settings.
 
 ## Limits
 
