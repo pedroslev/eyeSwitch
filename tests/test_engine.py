@@ -303,6 +303,23 @@ class EngineTest(unittest.TestCase):
         FakeTracker.face = looking_at(1400, 500)                          # eyes open: a real look at B
         self.assertTrue(self.wait_for(lambda: self.os.activated == [B]))
 
+    def test_the_shown_estimate_follows_at_once_while_the_decision_point_waits_to_be_sure(self):
+        e = self.start("window")
+        FakeTracker.face = looking_at(1000, 500)
+        self.assertTrue(self.wait_for(lambda: e.gaze_live is not None and e.gaze is not None))
+        time.sleep(0.3)
+        FakeTracker.face = looking_at(1800, 500)                     # a clear move, far outside the radius
+        t0, live_at, held_at = time.monotonic(), None, None
+        while time.monotonic() - t0 < 2 and held_at is None:
+            if live_at is None and e.gaze_live and e.gaze_live[0] > 1400:
+                live_at = time.monotonic() - t0
+            if e.gaze and e.gaze[0] > 1400:
+                held_at = time.monotonic() - t0
+            time.sleep(0.003)
+        self.assertIsNotNone(live_at)
+        self.assertIsNotNone(held_at)
+        self.assertLess(live_at, held_at)                            # flows first; the held point confirms later
+
     def test_a_one_frame_glitch_does_not_change_focus(self):
         self.start("window")
         FakeTracker.face = looking_at(500, 500)

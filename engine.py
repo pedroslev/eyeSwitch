@@ -14,7 +14,7 @@ import preview
 import virtualcam
 from backends.base import parse_keys
 from camwatch import CameraWatcher
-from gaze import FixationFilter, GazeModel
+from gaze import FixationFilter, GazeModel, OneEuro
 from gestures import Detector, GestureModel
 from samples import PAD_AFTER, BlinkDetector, clean_capture
 from tracker import Face, HeadTracker
@@ -252,7 +252,8 @@ class Engine:
         self.cfg = cfg
         self.status = "Starting..."
         self.yaw = None                 # smoothed head yaw in degrees, None when no face
-        self.gaze = None                # smoothed gaze point in desktop pixels (window mode)
+        self.gaze = None                # steady gaze point in desktop pixels (window mode): what decisions use
+        self.gaze_live = None           # the same, continuously smoothed: what the test dot shows
         self.vcam_state = "off"         # off / active / not set up / error: ...
         self.want_shapes = False        # the Gestures dialog is training: blendshapes are needed
         self.gestures_version = 0       # bumped when the bindings change
@@ -407,7 +408,7 @@ class Engine:
         px, py = xs.pointer()
         current = xs.monitor_at(self.monitors, px, py) or 0
         mouse_time, smooth, cand, cand_since = 0.0, None, None, 0.0
-        gaze_filter, filter_key = FixationFilter(), None
+        gaze_filter, filter_key, live_filter = FixationFilter(), None, OneEuro()
         win_checked, win_under, active_bounds = 0.0, None, None
         blink_detector, blink_until = BlinkDetector(), 0.0
         suppress_until, gesture_state = 0.0, (-1, [])      # (version, [(binding, model, detector)])
@@ -417,9 +418,10 @@ class Engine:
                 self.set_enabled(not self.cfg["enabled"])
             if not (self.cfg["enabled"] or self.calibrating or self.preview_wanted > 0):
                 camera.release()                  # let other apps have the camera while paused
-                self.yaw = self.gaze = None
+                self.yaw = self.gaze = self.gaze_live = None
                 smooth, cand = None, None
                 gaze_filter.update(None)
+                live_filter.update(None, time.monotonic())
                 self.status = "Paused"
                 time.sleep(0.1)
                 continue
@@ -465,8 +467,9 @@ class Engine:
             detectors = gesture_state[1]
 
             if face is None:
-                self.yaw = self.gaze = None
+                self.yaw = self.gaze = self.gaze_live = None
                 gaze_filter.update(None)
+                live_filter.update(None, now)
                 for _, _, det in detectors:
                     det.update(None, now)
                 cand = None
@@ -498,16 +501,20 @@ class Engine:
                     radius = min(max(2.2 * (model.noise_px or 90.0) * factor, 100.0), 320.0)
                     gaze_filter, filter_key = FixationFilter(radius, confirm), (id(model), level)
                 if model.range_excess(vec) > RANGE_LIMIT:
-                    self.out_of_range, self.gaze = True, None
+                    self.out_of_range, self.gaze, self.gaze_live = True, None, None
                     gaze_filter.update(None)
+                    live_filter.update(None, now)
                 elif blinking and self.gaze is not None:
                     pass                                             # hold the estimate through a blink
                 else:
-                    g = gaze_filter.update(model.predict(vec))
+                    raw = model.predict(vec)
+                    g, live = gaze_filter.update(raw), live_filter.update(raw, now)
                     self.gaze = clamp_to_monitors(g[0], g[1], monitors)
+                    self.gaze_live = clamp_to_monitors(live[0], live[1], monitors)
             else:
-                self.gaze = None
+                self.gaze = self.gaze_live = None
                 gaze_filter.update(None)
+                live_filter.update(None, now)
 
             # Gestures
             shapes = camera.tracker.shapes

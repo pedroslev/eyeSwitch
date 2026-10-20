@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from gaze import FixationFilter, GazeModel, Smoother, fit  # noqa: E402
+from gaze import FixationFilter, GazeModel, OneEuro, Smoother, fit  # noqa: E402
 
 GRID = [(fx, fy) for fy in (0.08, 0.5, 0.92) for fx in (0.08, 0.5, 0.92)]
 SCREEN = (3840, 1080)
@@ -157,6 +157,41 @@ class FixationFilterTest(unittest.TestCase):
         f.update((10, 10))
         self.assertIsNone(f.update(None))
         self.assertEqual(f.update((700, 300)), (700.0, 300.0))
+
+
+class OneEuroTest(unittest.TestCase):
+    def run_filter(self, points, fps=15.0, **kw):
+        f, out = OneEuro(**kw), []
+        for i, p in enumerate(points):
+            out.append(f.update(p, i / fps))
+        return np.array(out)
+
+    def test_a_still_point_stays_put(self):
+        out = self.run_filter([(500.0, 300.0)] * 30)
+        self.assertTrue(np.allclose(out, [500.0, 300.0]))
+
+    def test_smooths_jitter_when_still(self):
+        rng = np.random.default_rng(2)
+        raw = np.array([(500 + rng.normal(0, 60), 300 + rng.normal(0, 60)) for _ in range(120)])
+        out = self.run_filter(raw)
+        self.assertLess(out[20:].std(axis=0).max(), 0.6 * raw[20:].std(axis=0).max())
+
+    def test_follows_a_fast_move_with_little_lag_unlike_a_fixed_smoother(self):
+        step = [(0.0, 0.0)] * 10 + [(1500.0, 0.0)] * 10
+        euro = self.run_filter(step)[:, 0]
+        ema = np.array([Smoother(factor=0.2, window=1).update(p)[0] if False else 0 for p in step])
+        s, ema = Smoother(factor=0.2, window=1), []
+        for p in step:
+            ema.append(s.update(p)[0])
+        reach = lambda xs: next((i for i, v in enumerate(xs[10:]) if v > 1200), 99)   # frames to cover 80%
+        self.assertLess(reach(euro), reach(ema))
+        self.assertLessEqual(reach(euro), 4)
+
+    def test_resets_after_a_gap(self):
+        f = OneEuro()
+        f.update((10, 10), 0.0)
+        self.assertIsNone(f.update(None, 0.1))
+        self.assertEqual(f.update((900, 400), 5.0), (900.0, 400.0))
 
 
 if __name__ == "__main__":

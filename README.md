@@ -60,8 +60,10 @@ Window mode estimates where on the desktop you are looking from your head pose a
 of your irises. The full calibration fits that model and reports its estimated error (about 5% of a
 monitor width is typical for a webcam), for the centre of the screens and for their edges. It also
 saves `calibration_samples.npz` and `calibration_report.json` (grid and check errors per point)
-next to the settings, so a bad calibration can be analyzed. Tick **Show where it thinks I am looking** to see the
-estimate as a red dot while you tune it. **Camera view...** opens a live view of what the tracker sees (face mesh, eye corners in green,
+next to the settings, so a bad calibration can be analyzed. Tick **Show where it thinks I am looking** to see it while you tune it: a **red dot** is your gaze, smoothed
+and following you live (a One Euro filter, drawn at 60 fps with a speed cap so a long jump is seen
+travelling), and a **blue ring** is the steady point that actually decides which window gets focus.
+The ring holds still while you fixate and moves when you look somewhere else; the dot flows. **Camera view...** opens a live view of what the tracker sees (face mesh, eye corners in green,
 irises in red, yaw/pitch, iris offsets, head position, the gaze estimate), and by default the same view
 appears in the corner of the calibration screens. Use it first when the estimate looks wrong: if the
 irises are not on your irises, or the face keeps getting lost, calibration cannot work.
