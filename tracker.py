@@ -76,14 +76,18 @@ TRACK_FPS = 15          # face tracking rate; the camera may run faster to feed 
 
 
 class HeadTracker:
-    def __init__(self, camera=0, sink=None, hires=False, blendshapes=False):
+    def __init__(self, camera=0, sink=None, hires=False, blendshapes=False, height=720):
         """`sink(frame)` receives every camera frame (for the virtual camera) at 720p30 so calls look
         good, while tracking still runs at TRACK_FPS. `hires` asks for 720p without a sink: gaze
         needs it, because at 640x480 an eye is only ~20 px wide."""
         ensure_model()
         self.sink = sink
         hires = hires or sink is not None
-        width, height, fps = ((1280, 720, 30 if sink else TRACK_FPS) if hires else (640, 480, TRACK_FPS))
+        if hires:       # 720p or 1080p (1080p: ~20-30% less noise in pitch and iris offset, more CPU)
+            width, height, fps = (1920 if height >= 1080 else 1280), (1080 if height >= 1080 else 720), \
+                (30 if sink else TRACK_FPS)
+        else:
+            width, height, fps = 640, 480, TRACK_FPS
         self.cap = cv2.VideoCapture(camera, _capture_api())
         if hires:
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))   # needed for 720p30
@@ -139,7 +143,7 @@ class HeadTracker:
         if self.landmarks is None or self.matrix is None:
             return None
         pts = np.array([[p.x, p.y, p.z] for p in self.landmarks], np.float32)
-        return pts, self.matrix.astype(np.float32), self.frame_wh
+        return pts, self.matrix.astype(np.float32), self.frame_wh, (dict(self.shapes) if self.shapes else None)
 
     def close(self):
         self.cap.release()

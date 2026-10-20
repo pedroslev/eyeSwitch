@@ -85,11 +85,12 @@ class FakeTracker:
     fail_open, no_frames, shapes_on, shapes = False, False, None, None
     frame = np.zeros((48, 64, 3), np.uint8)
 
-    def __init__(self, camera=0, sink=None, hires=False, blendshapes=False):
+    def __init__(self, camera=0, sink=None, hires=False, blendshapes=False, height=720):
         if FakeTracker.fail_open:
             raise RuntimeError("device busy")
         FakeTracker.opens += 1
         FakeTracker.args = (camera, sink is not None, hires)
+        FakeTracker.height = height
         FakeTracker.shapes_on = blendshapes
         self.sink = sink
         self.landmarks = None
@@ -112,7 +113,7 @@ class FakeTracker:
         return FakeTracker.face, FakeTracker.frame
 
     def raw(self):
-        return np.zeros((478, 3), np.float32), np.eye(4, dtype=np.float32), (64, 48)
+        return np.zeros((478, 3), np.float32), np.eye(4, dtype=np.float32), (64, 48), {"eyeLookUpLeft": 0.1}
 
     def close(self):
         FakeTracker.closes += 1
@@ -451,8 +452,31 @@ class EngineTest(unittest.TestCase):
         faces = e.end_capture()
         self.assertGreater(len(faces), 5)
         self.assertEqual(len(e.last_capture_raw), len(faces))
-        landmarks, matrix, size = e.last_capture_raw[0]
-        self.assertEqual((landmarks.shape, matrix.shape, size), ((478, 3), (4, 4), (64, 48)))
+        landmarks, matrix, size, shapes = e.last_capture_raw[0]
+        self.assertEqual((landmarks.shape, matrix.shape, size, shapes), ((478, 3), (4, 4), (64, 48),
+                                                                          {"eyeLookUpLeft": 0.1}))
+
+    def test_the_camera_resolution_setting_reaches_the_tracker(self):
+        self.start("window", camera_height=1080)
+        self.assertTrue(self.wait_for(lambda: getattr(FakeTracker, "height", None) == 1080))
+
+    def test_a_gaze_model_calibrated_at_another_resolution_is_not_used(self):
+        e = self.start("window", camera_height=720)
+        self.assertTrue(e.window_mode)
+        e.cfg["camera_height"] = 1080                                   # changed without recalibrating
+        self.assertTrue(e.resolution_mismatch)
+        self.assertFalse(e.window_mode)
+        e.set_calibration([-20.0, 20.0], MONITORS, identity_model())    # a new calibration at 1080p
+        self.assertEqual(e.calib_height, 1080)
+        self.assertTrue(e.window_mode)
+
+    def test_the_calibration_remembers_its_resolution_across_restarts(self):
+        e = self.start("window", camera_height=1080)
+        e.set_calibration([-20.0, 20.0], MONITORS, identity_model(), 1080)
+        again = engine_mod.Engine({**engine_mod.DEFAULTS, "mode": "window", "camera_height": 1080})
+        self.engines.append(again)
+        self.assertEqual(again.calib_height, 1080)
+        self.assertFalse(again.resolution_mismatch)
 
     # --- debug view --------------------------------------------------------
     def test_preview_is_rendered_only_while_someone_watches(self):

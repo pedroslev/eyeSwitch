@@ -47,12 +47,12 @@ class FakeEngine:
             self.fail_captures -= 1
             self.last_capture_raw = []
             return []
-        self.last_capture_raw = [(np.zeros((478, 3), np.float32), np.eye(4, dtype=np.float32), (1280, 720))
-                                 for _ in out]
+        self.last_capture_raw = [(np.zeros((478, 3), np.float32), np.eye(4, dtype=np.float32), (1280, 720),
+                                  {"eyeLookUpLeft": 0.1, "eyeLookDownLeft": 0.2}) for _ in out]
         return out
 
-    def set_calibration(self, yaws, monitors, model=None):
-        self.saved = (yaws, model)
+    def set_calibration(self, yaws, monitors, model=None, camera_height=None):
+        self.saved = (yaws, model, camera_height)
 
 
 def face_for(x, y, rng):
@@ -104,7 +104,8 @@ class CalibrationFlowTest(unittest.TestCase):
         message = results[0][1]
         self.assertIn("Check on 6 new dots", message)
         self.assertIn("good", message)
-        yaws, model = eng.saved
+        yaws, model, height = eng.saved
+        self.assertEqual(height, 720)
         self.assertEqual(len(yaws), 2)
         self.assertNotIn(6, model.active)                         # the noisy iris feature is dropped
         self.assertFalse({2, 3, 4} & set(model.active))           # head position is never a gaze feature
@@ -116,6 +117,8 @@ class CalibrationFlowTest(unittest.TestCase):
         self.assertEqual(len(raw["landmarks"]), len(feats))
         self.assertEqual(raw["landmarks"].shape[1:], (478, 3))
         self.assertEqual(raw["matrices"].shape[1:], (4, 4))
+        self.assertEqual(raw["blendshapes"].shape, (len(feats), 2))              # the face's own expression scores
+        self.assertEqual(list(raw["blendshape_names"]), ["eyeLookDownLeft", "eyeLookUpLeft"])
         self.assertFalse(eng.calibrating)
 
     def test_a_dot_ruined_by_blinks_is_shown_again_once(self):

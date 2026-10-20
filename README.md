@@ -102,12 +102,33 @@ refine it. Things learned the hard way with real calibration data, all covered b
   lag on real data.
 - **Calibration is tied to where the camera sits.** Move the camera and recalibrate.
 
+What was tried on real calibration data (36 dots, leave-one-dot-out error; the current model scores
+120 px, 84 px on the held-out check dots) and did **not** help, so it is not in the code:
+
+| Idea | Result |
+|------|--------|
+| Iris offset in the head's own frame, built from the landmarks' depth | much worse (214 px): the landmark z is too noisy |
+| Each eye separately, roll, nose cue, a distance proxy, eyelid opening, iris between the lids | within noise (117-125 px) |
+| tan() of the angles (a pinhole-camera model), one model per monitor, kernel ridge | same or worse |
+| Quadratic instead of linear | same (the fit picks linear on its own) |
+| Head pose only, no irises | 282 px: the irises cut the error by more than half |
+| 1080p instead of 720p | 7-32% less noise in pitch and iris offset (little in yaw and vertical iris) |
+
+The remaining error is mostly vertical (8% of the screen height against 4% of the width): the eyelid
+hides part of the iris when you look up or down, and at 720p an eye is only ~36 px wide.
+
+Each full calibration also writes `calibration_raw.npz` (the 478 landmarks, the face pose and the
+face's own expression scores for every kept frame: numbers only, no images), in the same row order as
+`calibration_samples.npz`, so a different model can be tried on exactly the same calibration.
+
 In this mode the camera runs at 720p, because at 640x480 an eye is only ~20 px wide. It works best with big windows and a steady seat;
 redo the full calibration when you move the camera or change your posture a lot.
 The quick calibration discards a previous gaze model, since both describe the same setup.
 
 Settings: camera, mode, delay before switching monitor (default 300 ms), delay before focusing a
 window (500 ms), steadiness 1-5 (how firmly the gaze point is held still; higher is steadier and a little slower),
+camera resolution (720p or 1080p; a calibration only fits the resolution it was made at, and eyeSwitch
+says so if they differ),
 window edge tolerance (keeps the focus on the active window while your gaze is within
 this distance of it, `auto` follows the gaze error; raise it if focus flickers between two windows), wait after typing (2 s: window mode never changes focus inside a monitor while you
 are typing), start at login. Ctrl+Shift+G pauses and resumes; while paused the camera is released.

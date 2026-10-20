@@ -32,6 +32,7 @@ DEFAULTS = {
     "show_gaze": False,         # draw the estimated gaze point (for testing)
     "virtual_camera": False,    # Linux: republish the camera as "eyeSwitch Camera" for video calls
     "calibration_preview": True,  # show the camera view in a corner while calibrating
+    "camera_height": 720,       # window mode: 720 or 1080 (a calibration only fits the resolution it was made at)
     "stability": 3,             # window mode, 1..5: how steady the gaze point is (higher = steadier, slower)
     "edge_px": 0,               # window mode: stay on the active window within this many px of it (0 = auto)
     "gestures": {               # facial gestures that press keys; bindings come from the Gestures dialog
@@ -156,7 +157,8 @@ class Camera:
     def _wanted(self):
         cfg = self.engine.cfg
         return (cfg["camera"], bool(cfg["virtual_camera"]) and virtualcam.AVAILABLE, cfg["mode"] == "window",
-                self.engine.want_shapes or bool(self.engine.active_gestures()) or cfg["mode"] == "window")
+                self.engine.want_shapes or bool(self.engine.active_gestures()) or cfg["mode"] == "window",
+                cfg["camera_height"])
 
     def _watch(self, cam):
         path = f"/dev/video{cam}"
@@ -216,7 +218,7 @@ class Camera:
         return self._open(key, now)
 
     def _open(self, key, now):
-        e, (cam, want_vcam, hires, shapes) = self.engine, key
+        e, (cam, want_vcam, hires, shapes, height) = self.engine, key
         if self.watcher:
             self.watcher.ignore_for(2.0)                  # the opens below are ours
         sink, e.vcam_state = None, "off"
@@ -231,7 +233,7 @@ class Camera:
                 except Exception as ex:
                     e.vcam_state = f"error: {ex}"
         try:
-            self.tracker, self.key, self.yielded = HeadTracker(cam, sink, hires, shapes), key, False
+            self.tracker, self.key, self.yielded = HeadTracker(cam, sink, hires, shapes, height), key, False
             return True
         except Exception as ex:
             if self.vcam:
@@ -271,6 +273,7 @@ class Engine:
         self.on_change = None           # called from the worker thread when `enabled` flips
         self.monitors = backends.Session().monitors()
         self.centers, self.calib_monitors, self.gaze_model = None, None, None
+        self.calib_height = 720         # camera resolution the gaze model was calibrated at
         self._capture = self._shape_capture = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -284,6 +287,7 @@ class Engine:
             with open(CALIB_PATH) as f:
                 data = json.load(f)
             self.centers, self.calib_monitors = data["yaw"], data["monitors"]
+            self.calib_height = data.get("camera_height", 720)
             if data.get("gaze"):
                 model = GazeModel.from_dict(data["gaze"])
                 if len(model.mean) == len(Face._fields):
@@ -298,17 +302,25 @@ class Engine:
         return self.centers is not None and self.calib_monitors == [list(m) for m in self.monitors]
 
     @property
-    def window_mode(self):
-        """Gaze-based window focus is on and has a model for the current monitor layout."""
-        return self.cfg["mode"] == "window" and self.gaze_model is not None and self.calibrated
+    def resolution_mismatch(self):
+        """The gaze model was calibrated at another camera resolution than the one in use."""
+        return self.gaze_model is not None and self.calib_height != self.cfg["camera_height"]
 
-    def set_calibration(self, yaws, monitors, model=None):
-        """Store per-monitor head yaws; `model` is the gaze model of a full calibration."""
+    @property
+    def window_mode(self):
+        """Gaze-based window focus is on and has a model for the current layout and resolution."""
+        return (self.cfg["mode"] == "window" and self.gaze_model is not None and self.calibrated
+                and not self.resolution_mismatch)
+
+    def set_calibration(self, yaws, monitors, model=None, camera_height=None):
+        """Store per-monitor head yaws; `model` is the gaze model of a full calibration, made with the
+        camera at `camera_height` (the current setting by default)."""
         self.centers, self.calib_monitors, self.gaze_model = list(yaws), [list(m) for m in monitors], model
+        self.calib_height = camera_height or self.cfg["camera_height"]
         self.stale_model = False
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CALIB_PATH, "w") as f:
-            json.dump({"monitors": self.calib_monitors, "yaw": self.centers,
+            json.dump({"monitors": self.calib_monitors, "yaw": self.centers, "camera_height": self.calib_height,
                        "gaze": model.to_dict() if model else None}, f, indent=2)
 
     def begin_capture(self):
