@@ -88,6 +88,16 @@ class Session(BaseSession):
                 return wid
         return None
 
+    def window_at(self, x, y):
+        for wid, _pid, (wx, wy, w, h) in self._windows():
+            if wx <= x < wx + w and wy <= y < wy + h:
+                return wid
+        return None
+
+    def seconds_since_key(self):
+        return Quartz.CGEventSourceSecondsSinceLastEventType(
+            Quartz.kCGEventSourceStateCombinedSessionState, Quartz.kCGEventKeyDown)
+
     def activate(self, wid):
         w = self._find(wid)
         if w is None:

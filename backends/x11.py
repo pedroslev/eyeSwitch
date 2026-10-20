@@ -1,4 +1,6 @@
 """X11 backend: RandR monitors, EWMH window focus, pointer warp, XGrabKey hotkey."""
+import time
+
 from Xlib import X, XK, display, protocol
 from Xlib.error import CatchError
 
@@ -39,15 +41,19 @@ class Session(BaseSession):
         v = self._prop(self.root, "_NET_ACTIVE_WINDOW")
         return v[0] if v and v[0] else None
 
-    def _center(self, wid):
-        """Window center in root coordinates, or None if the window is gone/unmapped."""
+    def _bounds(self, wid):
+        """(x, y, w, h) in root coordinates, or None if the window is gone/unmapped."""
         try:
             win = self.d.create_resource_object("window", wid)
             g = win.get_geometry()
             c = self.root.translate_coords(win, 0, 0)
-            return c.x + g.width // 2, c.y + g.height // 2
+            return c.x, c.y, g.width, g.height
         except Exception:
             return None
+
+    def _center(self, wid):
+        b = self._bounds(wid)
+        return None if b is None else (b[0] + b[2] // 2, b[1] + b[3] // 2)
 
     def window_monitor(self, wid, monitors):
         c = self._center(wid)
@@ -72,6 +78,26 @@ class Session(BaseSession):
             if self._is_normal(wid) and self.window_monitor(wid, monitors) == idx:
                 return wid
         return None
+
+    def window_at(self, x, y):
+        for wid in reversed(self._prop(self.root, "_NET_CLIENT_LIST_STACKING")):
+            b = self._bounds(wid) if self._is_normal(wid) else None
+            if b and b[0] <= x < b[0] + b[2] and b[1] <= y < b[1] + b[3]:
+                return wid
+        return None
+
+    _MODIFIERS = ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Super_L",
+                  "Super_R", "Meta_L", "Meta_R", "Caps_Lock", "Num_Lock", "ISO_Level3_Shift")
+
+    def seconds_since_key(self):
+        """Polls the keyboard state; sustained typing is caught, a lone tap may be missed."""
+        if not hasattr(self, "_mod_codes"):
+            codes = {self.d.keysym_to_keycode(XK.string_to_keysym(n)) for n in self._MODIFIERS}
+            self._mod_codes, self._last_key = codes, float("-inf")
+        keymap = self.d.query_keymap()
+        if any(keymap[c // 8] >> (c % 8) & 1 for c in range(8, 256) if c not in self._mod_codes):
+            self._last_key = time.monotonic()
+        return time.monotonic() - self._last_key
 
     def exists(self, wid):
         return wid in self._prop(self.root, "_NET_CLIENT_LIST")

@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import urllib.request
+from collections import namedtuple
 
 import cv2
 import mediapipe as mp
@@ -13,6 +14,13 @@ from mediapipe.tasks.python import vision
 
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
              "face_landmarker/float16/1/face_landmarker.task")
+# Landmark ids (MediaPipe face mesh with iris): outer corner, inner corner, upper lid, lower lid, iris center.
+RIGHT_EYE = (33, 133, 159, 145, 468)
+LEFT_EYE = (263, 362, 386, 374, 473)
+
+# Everything the gaze model can use. yaw/pitch in degrees, tx/ty/tz = head position in the
+# camera frame, h/v = iris offset inside the eye (eye widths), vl = iris position between the lids.
+Face = namedtuple("Face", "yaw pitch tx ty tz h v vl")
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
 
 
@@ -75,7 +83,7 @@ class HeadTracker:
         self._t0 = time.monotonic()
 
     def read(self):
-        """Return (yaw_degrees or None, frame). Blocks to cap the frame rate."""
+        """Return (Face or None, frame). Blocks to cap the frame rate."""
         wait = self.min_interval - (time.monotonic() - self._last)
         if wait > 0:
             time.sleep(wait)
@@ -89,14 +97,37 @@ class HeadTracker:
         res = self.landmarker.detect_for_video(img, ts)
         if not res.facial_transformation_matrixes:
             return None, frame
-        return _yaw(np.array(res.facial_transformation_matrixes[0])), frame
+        face = _face(np.array(res.facial_transformation_matrixes[0]),
+                     res.face_landmarks[0], frame.shape[1], frame.shape[0])
+        return face, frame
 
     def close(self):
         self.cap.release()
         self.landmarker.close()
 
 
-def _yaw(m):
-    """Yaw in degrees from MediaPipe's 4x4 face transform (sign fixed by calibration)."""
+def _face(m, lm, w, h):
+    """Head pose from MediaPipe's 4x4 face transform plus iris features from the landmarks.
+
+    Signs are arbitrary (they depend on the camera); calibration absorbs them.
+    """
     r = m[:3, :3] / np.linalg.norm(m[:3, :3], axis=0)
-    return math.degrees(math.atan2(r[0, 2], r[2, 2]))
+    yaw = math.degrees(math.atan2(r[0, 2], r[2, 2]))
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, r[1, 2]))))
+    eyes = [_eye(lm, ids, w, h) for ids in (RIGHT_EYE, LEFT_EYE)]
+    hh, vv, vl = np.mean(eyes, axis=0)
+    return Face(yaw, pitch, float(m[0, 3]), float(m[1, 3]), float(m[2, 3]),
+                float(hh), float(vv), float(vl))
+
+
+def _eye(lm, ids, w, h):
+    """(h, v, vl) of one eye: iris offset along/across the corner line, and between the lids."""
+    outer, inner, top, bottom, iris = (np.array([lm[i].x * w, lm[i].y * h]) for i in ids)
+    left, right = (outer, inner) if outer[0] < inner[0] else (inner, outer)
+    axis = right - left
+    width = np.linalg.norm(axis)
+    axis /= width
+    perp = np.array([-axis[1], axis[0]])         # points down the image for a level head
+    off = iris - (left + right) / 2
+    lid = max(bottom[1] - top[1], 1e-3)
+    return off @ axis / width, off @ perp / width, (iris[1] - top[1]) / lid

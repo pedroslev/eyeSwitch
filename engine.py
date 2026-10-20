@@ -1,5 +1,6 @@
 """Tracking engine: webcam loop in a background thread, plus config and calibration storage."""
 import json
+import math
 import os
 import threading
 import time
@@ -7,17 +8,28 @@ import time
 import numpy as np
 
 import backends
+from gaze import GazeModel, Smoother
 from tracker import HeadTracker
 
 CONFIG_DIR = backends.config_dir()
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 CALIB_PATH = os.path.join(CONFIG_DIR, "calibration.json")
-DEFAULTS = {"camera": 0, "delay_ms": 300, "enabled": True}
+DEFAULTS = {
+    "camera": 0,
+    "delay_ms": 300,            # facing another monitor this long switches to it
+    "enabled": True,
+    "mode": "monitor",          # "monitor": head direction only; "window": gaze, needs full calibration
+    "window_delay_ms": 500,     # looking at another window of the same monitor this long focuses it
+    "typing_wait_s": 2.0,       # window mode: no same-monitor window changes this soon after typing
+    "show_gaze": False,         # draw the estimated gaze point (for testing)
+}
 
 SMOOTH = 0.4            # EMA factor for the yaw signal
 HYSTERESIS = 0.25       # must be this much closer to the target than to the current monitor
 MOUSE_QUIET = 1.5       # seconds without touching the mouse before we act
 FAR_FACTOR = 1.5        # ignore poses farther than this many spacings from every monitor
+EDGE_MARGIN = 0.04      # gaze must be this far (monitor widths) inside a monitor to move there
+WINDOW_POLL = 0.1       # seconds between "which window is under the gaze" lookups
 
 
 def load_config():
@@ -47,10 +59,29 @@ def pick_target(yaw, centers, current):
     return best
 
 
-def switch(xs, monitors, idx, last_window, last_pointer):
-    wid = last_window.get(idx)
-    if wid is None or not xs.exists(wid) or xs.window_monitor(wid, monitors) != idx:
-        wid = xs.top_window_on(monitors, idx)
+def nearest_monitor(x, y, monitors):
+    def dist(m):
+        return math.hypot(max(m.x - x, 0, x - (m.x + m.w)), max(m.y - y, 0, y - (m.y + m.h)))
+    return min(range(len(monitors)), key=lambda i: dist(monitors[i]))
+
+
+def gaze_monitor(x, y, monitors, current):
+    """Monitor under the gaze point; leaving `current` needs to be clearly inside the other one."""
+    best = nearest_monitor(x, y, monitors)
+    if best != current:
+        m = monitors[best]
+        margin = EDGE_MARGIN * m.w
+        if not (m.x + margin <= x < m.x + m.w - margin):
+            return current
+    return best
+
+
+def switch(xs, monitors, idx, last_window, last_pointer, wid=None):
+    """Move to monitor idx: focus `wid` (or its last/top window) and bring the pointer along."""
+    if wid is None:
+        wid = last_window.get(idx)
+        if wid is None or not xs.exists(wid) or xs.window_monitor(wid, monitors) != idx:
+            wid = xs.top_window_on(monitors, idx)
     m = monitors[idx]
     x, y = last_pointer.get(idx, (m.x + m.w // 2, m.y + m.h // 2))
     xs.warp(x, y)
@@ -63,10 +94,11 @@ class Engine:
         self.cfg = cfg
         self.status = "Starting..."
         self.yaw = None                 # smoothed head yaw in degrees, None when no face
+        self.gaze = None                # smoothed gaze point in desktop pixels (window mode)
         self.calibrating = False
         self.on_change = None           # called from the worker thread when `enabled` flips
         self.monitors = backends.Session().monitors()
-        self.centers, self.calib_monitors = None, None
+        self.centers, self.calib_monitors, self.gaze_model = None, None, None
         self._capture = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -80,6 +112,8 @@ class Engine:
             with open(CALIB_PATH) as f:
                 data = json.load(f)
             self.centers, self.calib_monitors = data["yaw"], data["monitors"]
+            if data.get("gaze"):
+                self.gaze_model = GazeModel.from_dict(data["gaze"])
         except (FileNotFoundError, ValueError, KeyError):
             pass
 
@@ -87,17 +121,25 @@ class Engine:
     def calibrated(self):
         return self.centers is not None and self.calib_monitors == [list(m) for m in self.monitors]
 
-    def set_calibration(self, yaws, monitors):
-        self.centers, self.calib_monitors = list(yaws), [list(m) for m in monitors]
+    @property
+    def window_mode(self):
+        """Gaze-based window focus is on and has a model for the current monitor layout."""
+        return self.cfg["mode"] == "window" and self.gaze_model is not None and self.calibrated
+
+    def set_calibration(self, yaws, monitors, model=None):
+        """Store per-monitor head yaws; `model` is the gaze model of a full calibration."""
+        self.centers, self.calib_monitors, self.gaze_model = list(yaws), [list(m) for m in monitors], model
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CALIB_PATH, "w") as f:
-            json.dump({"monitors": self.calib_monitors, "yaw": self.centers}, f, indent=2)
+            json.dump({"monitors": self.calib_monitors, "yaw": self.centers,
+                       "gaze": model.to_dict() if model else None}, f, indent=2)
 
     def begin_capture(self):
         with self._lock:
             self._capture = []
 
     def end_capture(self):
+        """Faces seen since begin_capture()."""
         with self._lock:
             samples, self._capture = self._capture or [], None
         return samples
@@ -126,6 +168,7 @@ class Engine:
         px, py = xs.pointer()
         current = xs.monitor_at(self.monitors, px, py) or 0
         mouse_time, smooth, cand, cand_since = 0.0, None, None, 0.0
+        gaze_filter, win_checked, win_under = Smoother(), 0.0, None
 
         while not self._stop.is_set():
             if hotkey_ok and xs.hotkey_pressed():
@@ -134,7 +177,9 @@ class Engine:
                 if tracker:                       # release the camera while paused
                     tracker.close()
                     tracker, opened = None, None
-                self.yaw, smooth, cand = None, None, None
+                self.yaw = self.gaze = None
+                smooth, cand = None, None
+                gaze_filter.update(None)
                 self.status = "Paused"
                 time.sleep(0.1)
                 continue
@@ -151,15 +196,24 @@ class Engine:
                     time.sleep(1.0)
                     continue
 
-            raw, _ = tracker.read()
+            try:
+                face, _ = tracker.read()
+            except Exception as e:                # show it instead of silently killing the thread
+                self.status = f"Tracking error: {e}"
+                tracker.close()
+                tracker, opened = None, None
+                time.sleep(1.0)
+                continue
             now = time.monotonic()
             monitors = self.monitors = xs.monitors()
+            window_mode = self.window_mode
 
             # Track the user's own activity so focus can be restored later.
             nx, ny = xs.pointer()
             if abs(nx - px) + abs(ny - py) > 2:
                 mouse_time = now
-                current = xs.monitor_at(monitors, nx, ny) or current
+                if not window_mode:
+                    current = xs.monitor_at(monitors, nx, ny) or current
             px, py = nx, ny
             m = xs.monitor_at(monitors, px, py)
             if m is not None:
@@ -169,25 +223,62 @@ class Engine:
                 wm = xs.window_monitor(aw, monitors)
                 if wm is not None:
                     last_window[wm] = aw
+                    if window_mode:
+                        current = wm
 
-            if raw is None:
-                self.yaw, cand = None, None
+            if face is None:
+                self.yaw = self.gaze = None
+                gaze_filter.update(None)
+                cand = None
                 self.status = "No face detected"
                 continue
             with self._lock:
                 if self._capture is not None:
-                    self._capture.append(raw)
-            smooth = raw if smooth is None else smooth + SMOOTH * (raw - smooth)
+                    self._capture.append(face)
+            smooth = face.yaw if smooth is None else smooth + SMOOTH * (face.yaw - smooth)
             self.yaw = smooth
 
             if not self.calibrated:
                 self.status = "Not calibrated: click Calibrate"
                 continue
-            current = min(current, len(self.centers) - 1)
+            current = min(current, len(monitors) - 1)
+            busy = self.calibrating or now - mouse_time < MOUSE_QUIET
+
+            if window_mode:
+                # --- gaze: which monitor and which window are you looking at -------------------
+                gx, gy = gaze_filter.update(self.gaze_model.predict(np.asarray(face, float)))
+                self.gaze = (gx, gy)
+                mon = gaze_monitor(gx, gy, monitors, current)
+                if now - win_checked >= WINDOW_POLL:
+                    win_checked, win_under = now, xs.window_at(gx, gy)
+                wid = win_under if xs.monitor_at(monitors, gx, gy) == mon else None
+                self.status = f"Looking at monitor {mon + 1}"
+                if busy:
+                    cand = None
+                    continue
+                if mon != current:
+                    key, need = ("mon", mon, wid), self.cfg["delay_ms"] / 1000
+                elif wid and wid != aw and xs.seconds_since_key() >= self.cfg["typing_wait_s"]:
+                    key, need = ("win", wid), self.cfg["window_delay_ms"] / 1000
+                else:
+                    cand = None
+                    continue
+                if cand != key:
+                    cand, cand_since = key, now
+                elif now - cand_since >= need:
+                    if mon != current:
+                        switch(xs, monitors, mon, last_window, last_pointer, wid)
+                    else:
+                        xs.activate(wid)
+                    current, cand = mon, None
+                    px, py = xs.pointer()             # our own warp is not mouse activity
+                continue
+
+            # --- head direction only: which monitor are you facing ---------------------------
+            self.gaze = None
             target = pick_target(smooth, self.centers, current)
             self.status = "Looking away" if target is None else f"Facing monitor {target + 1}"
-            if (self.calibrating or target is None or target == current
-                    or now - mouse_time < MOUSE_QUIET):
+            if busy or target is None or target == current:
                 cand = None
                 continue
             if cand != target:

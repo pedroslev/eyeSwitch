@@ -47,30 +47,56 @@ this folder or change Python environments. To run without installing: `python ey
 ## Use
 
 1. Open **eyeSwitch**.
-2. Click **Calibrate** and look at the dot on each monitor (~5 s each, Esc cancels).
+2. Pick a mode and calibrate (Esc cancels a calibration):
+
+| Mode | What it does | Calibration |
+|------|--------------|-------------|
+| **Monitor only** (default) | Focus follows the monitor your head is turned to. | *Quick*: look at one dot per monitor, ~5 s each. |
+| **Monitor and window** | Focus follows the window you are looking at, on any monitor. | *Full*: follow a dot over a 3x3 grid on each monitor, ~35 s total. |
+
 3. Keep it running. Closing the window hides it to the tray; Quit is in the tray menu.
 
-Settings: camera, delay before switching (default 300 ms), start at login.
-Ctrl+Shift+G pauses and resumes; while paused the camera is released.
-Nothing happens while you are using the mouse (and for 1.5 s after), and glances
-shorter than the delay are ignored. Recalibrate when you move the webcam or the monitors.
+Window mode estimates where on the desktop you are looking from your head pose and the position
+of your irises. The full calibration fits that model and reports its estimated error (about 5% of a
+monitor width is typical for a webcam). Tick **Show where it thinks I am looking** to see the
+estimate as a red dot while you tune it. It works best with big windows and a steady seat;
+redo the full calibration when you move the camera or change your posture a lot.
+The quick calibration discards a previous gaze model, since both describe the same setup.
+
+Settings: camera, mode, delay before switching monitor (default 300 ms), delay before focusing a
+window (500 ms), wait after typing (2 s: window mode never changes focus inside a monitor while you
+are typing), start at login. Ctrl+Shift+G pauses and resumes; while paused the camera is released.
+Nothing happens while you are using the mouse (and for 1.5 s after), and glances shorter than the
+delay are ignored. Recalibrate when you move the webcam or the monitors.
 
 Settings and calibration live in `~/.config/eyeswitch/` (Linux),
 `%APPDATA%\eyeSwitch` (Windows) or `~/Library/Application Support/eyeSwitch` (macOS).
 
 ## How it works
 
-- `tracker.py`: MediaPipe Face Landmarker, head yaw from the face transform matrix (~15 fps, 640x480).
+- `tracker.py`: MediaPipe Face Landmarker (~15 fps, 640x480): head yaw/pitch/position from the face
+  transform matrix, iris position from the landmarks.
+- `gaze.py`: ridge regression from those features to a desktop point, degree and regularization
+  chosen by leave-one-point-out cross-validation (this is also the error estimate).
 - `backends/`: one module per OS behind the same interface (`base.py`): monitors, pointer,
-  window focus, pause hotkey. `x11.py` uses RandR/EWMH, `windows.py` Win32 via ctypes,
+  windows (focus, which one is under a point), typing detection, pause hotkey. `x11.py` uses RandR/EWMH, `windows.py` Win32 via ctypes,
   `macos.py` Quartz plus the Accessibility API.
-- `engine.py`: background loop, nearest-monitor choice with hysteresis, dwell timer,
+- `engine.py`: background loop, nearest-monitor choice with hysteresis, dwell timers,
   restores the last focused window and pointer position on the target monitor.
 - `eyeswitch.py`: Qt app (settings window, calibration, tray). `autostart.py`: start at login.
 
 Everything runs locally; frames are never stored.
 
+## Tests
+
+```bash
+python -m unittest discover tests
+```
+
+They cover the gaze fit, the face feature geometry, and the engine decisions (fake camera and fake
+OS backend). Nothing in them touches your camera or your settings.
+
 ## Limits
 
-Head yaw only, no eye gaze yet, so it distinguishes monitors but not windows within one
-monitor. Monitors are expected side by side (left to right).
+A webcam gives a rough gaze estimate: small or tightly tiled windows can be confused, which is why
+monitor-only mode stays the default. Monitors are expected side by side (left to right).

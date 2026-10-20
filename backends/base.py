@@ -34,6 +34,14 @@ class BaseSession:
         """Topmost normal visible window centered on monitor idx, or None."""
         raise NotImplementedError
 
+    def window_at(self, x, y):
+        """Topmost normal visible window containing the point, or None."""
+        raise NotImplementedError
+
+    def seconds_since_key(self):
+        """Seconds since a typing key (not a modifier) was last seen pressed."""
+        raise NotImplementedError
+
     def exists(self, wid):
         raise NotImplementedError
 

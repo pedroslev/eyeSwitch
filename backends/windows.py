@@ -4,6 +4,7 @@ Coordinates are physical pixels; Qt makes the process per-monitor DPI aware when
 QApplication is created, so create it before the first Session.
 """
 import ctypes
+import time
 from ctypes import wintypes
 
 from .base import BaseSession, Monitor
@@ -107,6 +108,31 @@ class Session(BaseSession):
 
         user32.EnumWindows(_WNDENUMPROC(cb), 0)
         return result[0] if result else None
+
+    def window_at(self, x, y):
+        result = []
+
+        def cb(hwnd, _lparam):               # top to bottom: the first hit is the topmost
+            r = self._rect(hwnd) if self._is_normal(hwnd) else None
+            if r and r.left <= x < r.right and r.top <= y < r.bottom:
+                result.append(hwnd)
+                return False
+            return True
+
+        user32.EnumWindows(_WNDENUMPROC(cb), 0)
+        return result[0] if result else None
+
+    # virtual keys that are not typing: mouse buttons, modifiers, lock keys
+    _NOT_TYPING = {0x01, 0x02, 0x04, 0x05, 0x06, 0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C, 0x90, 0x91,
+                   0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+
+    def seconds_since_key(self):
+        if not hasattr(self, "_last_key"):
+            self._last_key = float("-inf")
+        if any(user32.GetAsyncKeyState(vk) & 0x8000
+               for vk in range(0x08, 0xFF) if vk not in self._NOT_TYPING):
+            self._last_key = time.monotonic()
+        return time.monotonic() - self._last_key
 
     def activate(self, hwnd):
         h = HWND(hwnd)
