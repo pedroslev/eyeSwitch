@@ -71,7 +71,7 @@ TRACK_FPS = 15          # face tracking rate; the camera may run faster to feed 
 
 
 class HeadTracker:
-    def __init__(self, camera=0, sink=None, hires=False):
+    def __init__(self, camera=0, sink=None, hires=False, blendshapes=False):
         """`sink(frame)` receives every camera frame (for the virtual camera) at 720p30 so calls look
         good, while tracking still runs at TRACK_FPS. `hires` asks for 720p without a sink: gaze
         needs it, because at 640x480 an eye is only ~20 px wide."""
@@ -92,7 +92,9 @@ class HeadTracker:
             running_mode=vision.RunningMode.VIDEO,
             num_faces=1,
             output_facial_transformation_matrixes=True,
+            output_face_blendshapes=blendshapes,
         )
+        self.shapes = None           # {blendshape name: 0..1} of the last frame, when enabled
         self.landmarker = vision.FaceLandmarker.create_from_options(opts)
         self.min_interval = 0.8 / TRACK_FPS          # 0.8: do not skip frames to timing jitter
         self._last = 0.0
@@ -113,6 +115,8 @@ class HeadTracker:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         res = self.landmarker.detect_for_video(img, int((now - self._t0) * 1000))
+        self.shapes = ({c.category_name: c.score for c in res.face_blendshapes[0]}
+                       if res.face_blendshapes else None)
         if not res.facial_transformation_matrixes:
             return None, frame
         face = _face(np.array(res.facial_transformation_matrixes[0]),

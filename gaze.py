@@ -8,6 +8,7 @@ import numpy as np
 
 DEGREES = (1, 2)
 ALPHAS = (1e-3, 1e-2, 1e-1, 1.0)         # scaled by the number of samples
+SIMPLICITY = 1.05                       # accept a simpler model this much worse than the best
 TRIM = 3.0                               # drop samples farther than TRIM x the median distance
 
 
@@ -29,6 +30,7 @@ class GazeModel:
     def __init__(self, degree, mean, std, weights, error_px=None):
         self.degree, self.mean, self.std = degree, np.asarray(mean), np.asarray(std)
         self.weights, self.error_px = np.asarray(weights), error_px
+        self.point_errors = {}
 
     def predict(self, vec):
         z = (np.asarray(vec, float) - self.mean) / self.std
@@ -63,21 +65,27 @@ def fit(features, targets, groups):
     keep = _trim_outliers(z, groups)
     z, y, groups = z[keep], y[keep], groups[keep]
 
-    best = None
+    candidates = []                                 # (cv rms, degree, alpha, per-point mean errors)
     for degree in DEGREES:
         a = _expand(z, degree)
         for alpha in ALPHAS:
-            sq = []
+            sq, per_point = [], {}
             for g in np.unique(groups):
                 test = groups == g
                 w = _ridge(a[~test], y[~test], alpha)
-                sq.append(np.sum((a[test] @ w - y[test]) ** 2, axis=1))
-            rms = float(np.sqrt(np.concatenate(sq).mean()))
-            if best is None or rms < best[0]:
-                best = (rms, degree, alpha)
-    rms, degree, alpha = best
+                err = np.sum((a[test] @ w - y[test]) ** 2, axis=1)
+                sq.append(err)
+                per_point[int(g)] = float(np.sqrt(err).mean())
+            candidates.append((float(np.sqrt(np.concatenate(sq).mean())), degree, alpha, per_point))
+    # A complex model that is only slightly better in cross-validation overshoots at the edges
+    # of the screen: take the simplest (low degree, strong regularization) within 5% of the best.
+    limit = min(c[0] for c in candidates) * SIMPLICITY
+    rms, degree, alpha, per_point = min((c for c in candidates if c[0] <= limit),
+                                        key=lambda c: (c[1], -c[2]))
     weights = _ridge(_expand(z, degree), y, alpha)
-    return GazeModel(degree, mean, std, weights, rms)
+    model = GazeModel(degree, mean, std, weights, rms)
+    model.point_errors = per_point                  # leave-one-point-out error per calibration point, px
+    return model
 
 
 class Smoother:

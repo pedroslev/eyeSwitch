@@ -77,6 +77,34 @@ class Session(BaseSession):
         r = self._rect(hwnd)
         return None if r is None else self.center_monitor(monitors, r.left, r.top, r.right, r.bottom)
 
+    def window_bounds(self, hwnd):
+        r = self._rect(hwnd)
+        return None if r is None else (r.left, r.top, r.right - r.left, r.bottom - r.top)
+
+    _VK = {"super": 0x5B, "ctrl": 0x11, "shift": 0x10, "alt": 0x12, "enter": 0x0D, "esc": 0x1B,
+           "tab": 0x09, "space": 0x20, "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+           "backspace": 0x08, "delete": 0x2E, "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22}
+
+    def _vk(self, name):
+        if name in self._VK:
+            return self._VK[name]
+        if len(name) == 1 and name.isalnum():
+            return ord(name.upper())
+        if name[0] == "f" and name[1:].isdigit() and 1 <= int(name[1:]) <= 12:
+            return 0x6F + int(name[1:])
+        raise ValueError(f"unknown key: {name}")
+
+    def press_keys(self, keys):
+        vks = [self._vk(k) for k in keys]
+        for vk in vks:
+            user32.keybd_event(vk, 0, 0, 0)
+        for vk in reversed(vks):
+            user32.keybd_event(vk, 0, 2, 0)                  # KEYEVENTF_KEYUP
+
+    def click(self):
+        user32.mouse_event(0x0002, 0, 0, 0, 0)               # left down
+        user32.mouse_event(0x0004, 0, 0, 0, 0)               # left up
+
     def exists(self, hwnd):
         return bool(user32.IsWindow(HWND(hwnd)))
 

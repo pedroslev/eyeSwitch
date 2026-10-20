@@ -14,6 +14,7 @@ import engine as engine_mod  # noqa: E402
 import virtualcam  # noqa: E402
 from backends.base import BaseSession, Monitor  # noqa: E402
 from gaze import GazeModel  # noqa: E402
+from gestures import GestureModel  # noqa: E402
 from tracker import Face  # noqa: E402
 
 MONITORS = [Monitor(0, 0, 1920, 1080), Monitor(1920, 0, 1920, 1080)]
@@ -25,6 +26,7 @@ A, B, C = 1, 2, 3
 class FakeSession(BaseSession):
     def __init__(self):
         self.active, self.activated, self.warps, self.key_age = A, [], [], 99.0
+        self.pressed, self.clicks = [], 0
 
     def monitors(self):
         return MONITORS
@@ -49,6 +51,17 @@ class FakeSession(BaseSession):
         return next((wid for wid, (wx, wy, w, h) in WINDOWS.items()
                      if wx <= x < wx + w and wy <= y < wy + h), None)
 
+    def window_bounds(self, wid):
+        return WINDOWS.get(wid)
+
+    def press_keys(self, keys):
+        if "nonsense" in keys:
+            raise ValueError("unknown key: nonsense")
+        self.pressed.append(list(keys))
+
+    def click(self):
+        self.clicks += 1
+
     def seconds_since_key(self):
         return self.key_age
 
@@ -68,14 +81,19 @@ class FakeSession(BaseSession):
 
 class FakeTracker:
     face, opens, closes, args = None, 0, 0, None     # args: (camera, has_sink, hires) of the last open
-    fail_open, no_frames = False, False
+    fail_open, no_frames, shapes_on, shapes = False, False, None, None
 
-    def __init__(self, camera=0, sink=None, hires=False):
+    def __init__(self, camera=0, sink=None, hires=False, blendshapes=False):
         if FakeTracker.fail_open:
             raise RuntimeError("device busy")
         FakeTracker.opens += 1
         FakeTracker.args = (camera, sink is not None, hires)
+        FakeTracker.shapes_on = blendshapes
         self.sink = sink
+
+    @property
+    def shapes(self):
+        return FakeTracker.shapes if FakeTracker.shapes_on else None
 
     def read(self):
         time.sleep(0.02)
@@ -129,6 +147,13 @@ def identity_model():
     return GazeModel(1, np.zeros(7), np.ones(7), w, 100.0)
 
 
+BROWS = GestureModel(["browInnerUp"], [1.0 / 0.7], 0.0, 4.0)    # score 1 when browInnerUp = 0.7
+
+
+def binding(label="Eyebrows", action="keys", keys="super", hold_ms=100):
+    return {"label": label, "action": action, "keys": keys, "hold_ms": hold_ms, "model": BROWS.to_dict()}
+
+
 class EngineTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -145,6 +170,7 @@ class EngineTest(unittest.TestCase):
         backends.Session = lambda: self.os
         FakeTracker.face, FakeTracker.opens, FakeTracker.closes, FakeTracker.args = None, 0, 0, None
         FakeTracker.fail_open = FakeTracker.no_frames = False
+        FakeTracker.shapes_on = FakeTracker.shapes = None
         FakeWatcher.instance = FakeVCam.instance = None
         self.engines = []
 
@@ -231,6 +257,102 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(self.os.activated, [])
         self.assertEqual(e.status, "Paused")
 
+
+    # --- window edges ------------------------------------------------------
+    def test_stays_on_the_active_window_near_its_edge(self):
+        self.start("window", edge_px=100)                    # active window is A (x 0..960)
+        FakeTracker.face = looking_at(1010, 500)             # 50 px into B: inside A's tolerance
+        time.sleep(0.9)
+        self.assertEqual(self.os.activated, [])
+        FakeTracker.face = looking_at(1200, 500)             # clearly inside B
+        self.assertTrue(self.wait_for(lambda: self.os.activated == [B]))
+
+    def test_gaze_past_the_screen_edge_is_clamped_to_it(self):
+        e = self.start("window")
+        FakeTracker.face = looking_at(-500, 5000)            # the model overshoots wildly
+        self.assertTrue(self.wait_for(lambda: e.gaze is not None and e.gaze == (0, 1079)))
+
+    # --- gestures ----------------------------------------------------------
+    def gestures(self, mode, *bindings, **cfg):
+        e = self.start(mode, **cfg)
+        e.cfg["gestures"] = {"enabled": True, "pause_s": 1.0, "bindings": list(bindings)}
+        e.gestures_changed()
+        return e
+
+    def test_gesture_presses_keys(self):
+        self.gestures("monitor", binding())
+        FakeTracker.face = looking_at(500, 500)
+        FakeTracker.shapes = {"browInnerUp": 0.0}
+        self.assertTrue(self.wait_for(lambda: FakeTracker.shapes_on))      # blendshapes got switched on
+        time.sleep(0.3)
+        self.assertEqual(self.os.pressed, [])
+        FakeTracker.shapes = {"browInnerUp": 0.7}                          # eyebrows up
+        self.assertTrue(self.wait_for(lambda: self.os.pressed == [["super"]]))
+        time.sleep(0.4)
+        self.assertEqual(len(self.os.pressed), 1)                          # once per gesture
+
+    def test_gesture_waits_for_the_hold_time(self):
+        self.gestures("monitor", binding(hold_ms=400))
+        FakeTracker.face = looking_at(500, 500)
+        FakeTracker.shapes = {"browInnerUp": 0.7}
+        time.sleep(0.2)
+        FakeTracker.shapes = {"browInnerUp": 0.0}                          # a twitch
+        time.sleep(0.5)
+        self.assertEqual(self.os.pressed, [])
+
+    def test_click_gesture_clicks_where_you_look(self):
+        e = self.gestures("window", binding("Bite", "click", ""))
+        FakeTracker.face = looking_at(2900, 400)
+        FakeTracker.shapes = {"browInnerUp": 0.7}
+        self.assertTrue(self.wait_for(lambda: self.os.clicks == 1))
+        self.assertIn((2900, 400), self.os.warps)
+        self.assertIn("clicked", e.gesture_log)
+
+    def test_click_gesture_in_monitor_mode_still_uses_gaze_if_calibrated(self):
+        self.gestures("monitor", binding("Bite", "click", ""))
+        FakeTracker.face = looking_at(2900, 400, yaw=-20.0)                # head on monitor 1
+        FakeTracker.shapes = {"browInnerUp": 0.7}
+        self.assertTrue(self.wait_for(lambda: self.os.clicks == 1))
+        self.assertIn((2900, 400), self.os.warps)
+
+    def test_key_gesture_silences_automatic_focus_for_a_while(self):
+        self.gestures("window", binding())                                  # pause_s = 1.0
+        FakeTracker.face = looking_at(1400, 500)                            # looking at B, A is active
+        FakeTracker.shapes = {"browInnerUp": 0.7}
+        self.assertTrue(self.wait_for(lambda: self.os.pressed == [["super"]]))
+        FakeTracker.shapes = {"browInnerUp": 0.0}
+        time.sleep(0.7)
+        self.assertEqual(self.os.activated, [])                             # the overview owns the focus
+        self.assertTrue(self.wait_for(lambda: self.os.activated == [B], timeout=2.5))
+
+    def test_bad_key_is_reported_not_fatal(self):
+        e = self.gestures("monitor", binding(keys="nonsense"))
+        FakeTracker.face = looking_at(500, 500)
+        FakeTracker.shapes = {"browInnerUp": 0.7}
+        self.assertTrue(self.wait_for(lambda: "failed" in e.gesture_log))
+        self.assertTrue(self.engines[0]._thread.is_alive())
+
+    def test_gestures_off_means_no_blendshapes_and_no_keys(self):
+        e = self.start("monitor")
+        e.cfg["gestures"] = {"enabled": False, "pause_s": 1.0, "bindings": [binding()]}
+        e.gestures_changed()
+        FakeTracker.face = looking_at(500, 500)
+        FakeTracker.shapes = {"browInnerUp": 0.7}
+        time.sleep(0.5)
+        self.assertFalse(FakeTracker.shapes_on)
+        self.assertEqual(self.os.pressed, [])
+
+    def test_training_turns_blendshapes_on_and_collects_them(self):
+        e = self.start("monitor")
+        FakeTracker.face = looking_at(500, 500)
+        FakeTracker.shapes = {"browInnerUp": 0.3}
+        e.want_shapes = e.calibrating = True
+        self.assertTrue(self.wait_for(lambda: FakeTracker.shapes_on))
+        e.begin_shape_capture()
+        time.sleep(0.4)
+        samples = e.end_shape_capture()
+        self.assertGreater(len(samples), 5)
+        self.assertEqual(samples[0], {"browInnerUp": 0.3})
 
     # --- sharing the camera ------------------------------------------------
     def test_yields_the_camera_when_another_app_opens_it_then_takes_it_back(self):

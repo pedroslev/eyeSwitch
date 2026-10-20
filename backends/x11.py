@@ -2,6 +2,7 @@
 import time
 
 from Xlib import X, XK, display, protocol
+from Xlib.ext import xtest
 from Xlib.error import CatchError
 
 from .base import BaseSession, Monitor
@@ -98,6 +99,35 @@ class Session(BaseSession):
         if any(keymap[c // 8] >> (c % 8) & 1 for c in range(8, 256) if c not in self._mod_codes):
             self._last_key = time.monotonic()
         return time.monotonic() - self._last_key
+
+    def window_bounds(self, wid):
+        return self._bounds(wid)
+
+    _KEYSYMS = {"super": "Super_L", "ctrl": "Control_L", "shift": "Shift_L", "alt": "Alt_L",
+                "enter": "Return", "esc": "Escape", "tab": "Tab", "space": "space", "left": "Left",
+                "right": "Right", "up": "Up", "down": "Down", "backspace": "BackSpace",
+                "delete": "Delete", "home": "Home", "end": "End", "pageup": "Prior", "pagedown": "Next"}
+
+    def _keycode(self, name):
+        sym = self._KEYSYMS.get(name) or (name.upper() if len(name) > 1 and name[0] == "f" and name[1:].isdigit()
+                                          else name)
+        code = self.d.keysym_to_keycode(XK.string_to_keysym(sym))
+        if not code:
+            raise ValueError(f"unknown key: {name}")
+        return code
+
+    def press_keys(self, keys):
+        codes = [self._keycode(k) for k in keys]
+        for c in codes:
+            xtest.fake_input(self.d, X.KeyPress, c)
+        for c in reversed(codes):
+            xtest.fake_input(self.d, X.KeyRelease, c)
+        self.d.sync()
+
+    def click(self):
+        xtest.fake_input(self.d, X.ButtonPress, 1)
+        xtest.fake_input(self.d, X.ButtonRelease, 1)
+        self.d.sync()
 
     def exists(self, wid):
         return wid in self._prop(self.root, "_NET_CLIENT_LIST")

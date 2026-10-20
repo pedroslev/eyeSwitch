@@ -57,6 +57,22 @@ class GazeTest(unittest.TestCase):
         probe = x[100]
         self.assertLess(np.hypot(*(np.array(glitchy.predict(probe)) - clean.predict(probe))), 250)
 
+    def test_prefers_the_linear_model_when_it_is_enough(self):
+        rng = np.random.default_rng(7)
+        groups = np.repeat(np.arange(18), 25)
+        x = rng.normal(0, 1, (len(groups), 7))
+        centers = rng.normal(0, 1, (18, 7))
+        x = centers[groups] + rng.normal(0, 0.05, (len(groups), 7))
+        y = np.stack([960 + 300 * x[:, 0] + 100 * x[:, 5], 540 + 200 * x[:, 1]], axis=1)
+        y += rng.normal(0, 5, y.shape)
+        self.assertEqual(fit(x, y, groups).degree, 1)
+
+    def test_reports_the_error_of_every_calibration_point(self):
+        x, y, g = synthetic(noise=0.3, seed=4)
+        model = fit(x, y, g)
+        self.assertEqual(sorted(model.point_errors), list(range(18)))
+        self.assertTrue(all(e > 0 for e in model.point_errors.values()))
+
     def test_roundtrip_dict(self):
         x, y, g = synthetic(noise=0.2)
         model = fit(x, y, g)

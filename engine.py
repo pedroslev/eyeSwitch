@@ -1,4 +1,5 @@
 """Tracking engine: webcam loop in a background thread, plus config and calibration storage."""
+import copy
 import json
 import math
 import os
@@ -10,8 +11,10 @@ import numpy as np
 
 import backends
 import virtualcam
+from backends.base import parse_keys
 from camwatch import CameraWatcher
 from gaze import GazeModel, Smoother
+from gestures import Detector, GestureModel
 from tracker import HeadTracker
 
 CONFIG_DIR = backends.config_dir()
@@ -26,6 +29,12 @@ DEFAULTS = {
     "typing_wait_s": 2.0,       # window mode: no same-monitor window changes this soon after typing
     "show_gaze": False,         # draw the estimated gaze point (for testing)
     "virtual_camera": False,    # Linux: republish the camera as "eyeSwitch Camera" for video calls
+    "edge_px": 0,               # window mode: stay on the active window within this many px of it (0 = auto)
+    "gestures": {               # facial gestures that press keys; bindings come from the Gestures dialog
+        "enabled": False,
+        "pause_s": 6.0,         # after a key gesture, no automatic focus changes for this long (menus, overview)
+        "bindings": [],         # {"label", "action": keys|click|toggle, "keys", "hold_ms", "model"}
+    },
 }
 
 SMOOTH = 0.4            # EMA factor for the yaw signal
@@ -38,11 +47,13 @@ RETRY = 4.0             # seconds of calm before taking the camera back from ano
 
 
 def load_config():
+    cfg = copy.deepcopy(DEFAULTS)
     try:
         with open(CONFIG_PATH) as f:
-            return {**DEFAULTS, **json.load(f)}
+            cfg.update(json.load(f))
     except (FileNotFoundError, ValueError):
-        return dict(DEFAULTS)
+        pass
+    return cfg
 
 
 def save_config(cfg):
@@ -81,6 +92,28 @@ def gaze_monitor(x, y, monitors, current):
     return best
 
 
+def clamp_to_monitors(x, y, monitors):
+    """Nearest point on a monitor: an estimate past the screen edge means "at the edge"."""
+    m = monitors[nearest_monitor(x, y, monitors)]
+    return min(max(x, m.x), m.x + m.w - 1), min(max(y, m.y), m.y + m.h - 1)
+
+
+def edge_margin_px(cfg, model):
+    """Distance past a window's edge the gaze must travel before focus leaves that window."""
+    if cfg["edge_px"] > 0:
+        return cfg["edge_px"]
+    return min(max(0.6 * (model.error_px or 0), 40), 250)
+
+
+def stay_on_active(wid, active, bounds, point, margin):
+    """Window to focus: keep `active` while the gaze is within `margin` of its edges."""
+    if active and bounds and wid != active:
+        x, y, w, h = bounds
+        if x - margin <= point[0] < x + w + margin and y - margin <= point[1] < y + h + margin:
+            return active
+    return wid
+
+
 def switch(xs, monitors, idx, last_window, last_pointer, wid=None):
     """Move to monitor idx: focus `wid` (or its last/top window) and bring the pointer along."""
     if wid is None:
@@ -109,7 +142,8 @@ class Camera:
 
     def _wanted(self):
         cfg = self.engine.cfg
-        return (cfg["camera"], bool(cfg["virtual_camera"]) and virtualcam.AVAILABLE, cfg["mode"] == "window")
+        return (cfg["camera"], bool(cfg["virtual_camera"]) and virtualcam.AVAILABLE, cfg["mode"] == "window",
+                self.engine.want_shapes or bool(self.engine.active_gestures()))
 
     def _watch(self, cam):
         path = f"/dev/video{cam}"
@@ -169,7 +203,7 @@ class Camera:
         return self._open(key, now)
 
     def _open(self, key, now):
-        e, (cam, want_vcam, hires) = self.engine, key
+        e, (cam, want_vcam, hires, shapes) = self.engine, key
         if self.watcher:
             self.watcher.ignore_for(2.0)                  # the opens below are ours
         sink, e.vcam_state = None, "off"
@@ -184,7 +218,7 @@ class Camera:
                 except Exception as ex:
                     e.vcam_state = f"error: {ex}"
         try:
-            self.tracker, self.key, self.yielded = HeadTracker(cam, sink, hires), key, False
+            self.tracker, self.key, self.yielded = HeadTracker(cam, sink, hires, shapes), key, False
             return True
         except Exception as ex:
             if self.vcam:
@@ -207,11 +241,16 @@ class Engine:
         self.yaw = None                 # smoothed head yaw in degrees, None when no face
         self.gaze = None                # smoothed gaze point in desktop pixels (window mode)
         self.vcam_state = "off"         # off / active / not set up / error: ...
+        self.want_shapes = False        # the Gestures dialog is training: blendshapes are needed
+        self.gestures_version = 0       # bumped when the bindings change
+        self.gesture_scores = {}        # label -> latest score (0 relaxed, 1 gesture), for live feedback
+        self.gesture_log = ""           # what the last gesture did, or why it failed
+        self.shapes_seen = 0.0          # monotonic time of the last frame that carried blendshapes
         self.calibrating = False
         self.on_change = None           # called from the worker thread when `enabled` flips
         self.monitors = backends.Session().monitors()
         self.centers, self.calib_monitors, self.gaze_model = None, None, None
-        self._capture = None
+        self._capture = self._shape_capture = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._load_calibration()
@@ -256,6 +295,48 @@ class Engine:
             samples, self._capture = self._capture or [], None
         return samples
 
+    def begin_shape_capture(self):
+        with self._lock:
+            self._shape_capture = []
+
+    def end_shape_capture(self):
+        """Blendshape dicts seen since begin_shape_capture()."""
+        with self._lock:
+            samples, self._shape_capture = self._shape_capture or [], None
+        return samples
+
+    # --- gestures ----------------------------------------------------------
+    def active_gestures(self):
+        """Bindings that are switched on and trained."""
+        g = self.cfg["gestures"]
+        return [b for b in g["bindings"] if g["enabled"] and b.get("model")]
+
+    def gestures_changed(self):
+        save_config(self.cfg)
+        self.gestures_version += 1
+
+    def _fire(self, xs, binding):
+        """Run a gesture's action; returns seconds during which automatic focus stays quiet."""
+        label, action = binding["label"], binding.get("action", "keys")
+        try:
+            if action == "keys":
+                keys = parse_keys(binding.get("keys", ""))
+                xs.press_keys(keys)
+                self.gesture_log = f"{label}: pressed {'+'.join(keys)}"
+                return float(self.cfg["gestures"].get("pause_s", 6.0))
+            if action == "click":
+                if self.gaze:
+                    xs.warp(int(self.gaze[0]), int(self.gaze[1]))
+                xs.click()
+                self.gesture_log = f"{label}: clicked" + (" where you look" if self.gaze else "")
+                return 1.0
+            if action == "toggle":
+                self.set_enabled(not self.cfg["enabled"])
+                self.gesture_log = f"{label}: toggled eyeSwitch"
+        except Exception as e:
+            self.gesture_log = f"{label} failed: {e}"
+        return 0.0
+
     # --- control -----------------------------------------------------------
     def set_enabled(self, value):
         self.cfg["enabled"] = value
@@ -280,7 +361,8 @@ class Engine:
         px, py = xs.pointer()
         current = xs.monitor_at(self.monitors, px, py) or 0
         mouse_time, smooth, cand, cand_since = 0.0, None, None, 0.0
-        gaze_filter, win_checked, win_under = Smoother(), 0.0, None
+        gaze_filter, win_checked, win_under, active_bounds = Smoother(), 0.0, None, None
+        suppress_until, gesture_state = 0.0, (-1, [])      # (version, [(binding, model, detector)])
 
         while not self._stop.is_set():
             if hotkey_ok and xs.hotkey_pressed():
@@ -326,32 +408,65 @@ class Engine:
                     if window_mode:
                         current = wm
 
+            if gesture_state[0] != self.gestures_version:          # bindings changed: rebuild detectors
+                gesture_state = (self.gestures_version, [
+                    (b, GestureModel.from_dict(b["model"]), Detector(b.get("hold_ms", 250) / 1000))
+                    for b in self.active_gestures()])
+            detectors = gesture_state[1]
+
             if face is None:
                 self.yaw = self.gaze = None
                 gaze_filter.update(None)
+                for _, _, det in detectors:
+                    det.update(None, now)
                 cand = None
                 self.status = "No face detected"
                 continue
+            if camera.tracker.shapes:
+                self.shapes_seen = now
             with self._lock:
                 if self._capture is not None:
                     self._capture.append(face)
+                if self._shape_capture is not None and camera.tracker.shapes:
+                    self._shape_capture.append(dict(camera.tracker.shapes))
             smooth = face.yaw if smooth is None else smooth + SMOOTH * (face.yaw - smooth)
             self.yaw = smooth
 
-            if not self.calibrated:
+            # Where on the desktop are you looking (window mode, or to click where you look).
+            calibrated = self.calibrated
+            click_wanted = any(b.get("action") == "click" for b, _, _ in detectors)
+            if calibrated and self.gaze_model is not None and (window_mode or click_wanted):
+                g = gaze_filter.update(self.gaze_model.predict(np.asarray(face, float)))
+                self.gaze = clamp_to_monitors(g[0], g[1], monitors)
+            else:
+                self.gaze = None
+                gaze_filter.update(None)
+
+            # Gestures
+            shapes = camera.tracker.shapes
+            for b, model, det in detectors:
+                score = model.score(shapes) if shapes else None
+                if score is not None:
+                    self.gesture_scores[b["label"]] = score
+                if det.update(score, now) and not self.calibrating:
+                    suppress_until = max(suppress_until, now + self._fire(xs, b))
+                    px, py = xs.pointer()                         # our own warp is not mouse activity
+
+            if not calibrated:
                 self.status = "Not calibrated: click Calibrate"
                 continue
             current = min(current, len(monitors) - 1)
-            busy = self.calibrating or now - mouse_time < MOUSE_QUIET
+            busy = self.calibrating or now - mouse_time < MOUSE_QUIET or now < suppress_until
 
             if window_mode:
                 # --- gaze: which monitor and which window are you looking at -------------------
-                gx, gy = gaze_filter.update(self.gaze_model.predict(np.asarray(face, float)))
-                self.gaze = (gx, gy)
+                gx, gy = self.gaze
                 mon = gaze_monitor(gx, gy, monitors, current)
                 if now - win_checked >= WINDOW_POLL:
                     win_checked, win_under = now, xs.window_at(gx, gy)
+                    active_bounds = xs.window_bounds(aw) if aw else None
                 wid = win_under if xs.monitor_at(monitors, gx, gy) == mon else None
+                wid = stay_on_active(wid, aw, active_bounds, (gx, gy), edge_margin_px(self.cfg, self.gaze_model))
                 self.status = f"Looking at monitor {mon + 1}"
                 if busy:
                     cand = None
@@ -375,7 +490,6 @@ class Engine:
                 continue
 
             # --- head direction only: which monitor are you facing ---------------------------
-            self.gaze = None
             target = pick_target(smooth, self.centers, current)
             self.status = "Looking away" if target is None else f"Facing monitor {target + 1}"
             if busy or target is None or target == current:

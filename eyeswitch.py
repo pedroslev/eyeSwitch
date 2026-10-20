@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """eyeSwitch: move keyboard focus to the monitor (or window) you are looking at (webcam)."""
 import ctypes.util
+import json
 import os
 import statistics
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "data")
@@ -35,19 +37,22 @@ import numpy as np  # noqa: E402
 from PySide6.QtCore import QObject, QPointF, Qt, QTimer, Signal  # noqa: E402
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPen  # noqa: E402
 from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,  # noqa: E402
-                               QFormLayout, QHBoxLayout, QLabel, QMenu, QMessageBox,
-                               QPushButton, QSpinBox, QSystemTrayIcon, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,  # noqa: E402
+                               QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox,
+                               QProgressBar, QPushButton, QSpinBox, QSystemTrayIcon, QVBoxLayout,
+                               QWidget)
 
 import autostart  # noqa: E402
 import backends  # noqa: E402
 import gaze  # noqa: E402
+import gestures  # noqa: E402
 import virtualcam  # noqa: E402
-from engine import Engine, load_config, nearest_monitor, save_config  # noqa: E402
+from engine import CONFIG_DIR, Engine, load_config, nearest_monitor, save_config  # noqa: E402
 from tracker import list_cameras  # noqa: E402
 
 MODES = [("Monitor only (head direction)", "monitor"), ("Monitor and window (gaze)", "window")]
-GRID = (0.08, 0.5, 0.92)               # dot positions of the full calibration, as screen fractions
+GRID_X = (0.06, 0.28, 0.5, 0.72, 0.94)  # dot positions of the full calibration, as screen fractions
+GRID_Y = (0.08, 0.5, 0.92)
 
 
 def icon(name):
@@ -173,7 +178,7 @@ class QuickCalibration(CalibrationBase):
 
 
 class FullCalibration(CalibrationBase):
-    """Follow a dot over a 3x3 grid on each monitor with your eyes; fits the gaze model."""
+    """Follow a dot over a 5x3 grid on each monitor with your eyes; fits the gaze model."""
 
     SETTLE_MS, SAMPLE_MS, INTRO_MS = 800, 1000, 1800
 
@@ -181,8 +186,8 @@ class FullCalibration(CalibrationBase):
         super().__init__(engine, on_done)
         self.steps = []                              # (monitor, fx, fy), snake order per monitor
         for mon in range(len(self.monitors)):
-            for row, fy in enumerate(GRID):
-                for fx in (GRID if row % 2 == 0 else GRID[::-1]):
+            for row, fy in enumerate(GRID_Y):
+                for fx in (GRID_X if row % 2 == 0 else GRID_X[::-1]):
                     self.steps.append((mon, fx, fy))
         self.samples, self.i, self.win_mon = [], 0, None
         self._next()
@@ -235,8 +240,30 @@ class FullCalibration(CalibrationBase):
         model = gaze.fit(np.array(feats), np.array(targets), np.array(groups))
         self.engine.set_calibration(yaws, self.monitors, model)
         width = statistics.mean(m.w for m in self.monitors)
+
+        edge, inner, report = [], [], []
+        for k, (mon, fx, fy) in enumerate(self.steps):
+            err = model.point_errors.get(k)
+            on_edge = fx in (GRID_X[0], GRID_X[-1]) or fy in (GRID_Y[0], GRID_Y[-1])
+            if err is not None:
+                (edge if on_edge else inner).append(err)
+            report.append({"monitor": mon + 1, "x": fx, "y": fy, "error_px": err,
+                           "samples": len(self.samples[k]), "edge": on_edge})
+        try:                      # kept so a bad calibration can be analyzed offline
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            np.savez_compressed(os.path.join(CONFIG_DIR, "calibration_samples.npz"),
+                                features=np.array(feats), targets=np.array(targets),
+                                groups=np.array(groups), steps=np.array(self.steps))
+            with open(os.path.join(CONFIG_DIR, "calibration_report.json"), "w") as f:
+                json.dump({"degree": model.degree, "error_px": model.error_px, "points": report}, f, indent=2)
+        except OSError:
+            pass
+        detail = ""
+        if edge and inner:
+            detail = (f"\nCenter of the screens: ~{statistics.mean(inner):.0f} px, "
+                      f"edges: ~{statistics.mean(edge):.0f} px.")
         self._finish(True, f"Calibration saved.\nEstimated gaze error: about {model.error_px:.0f} px "
-                           f"({100 * model.error_px / width:.0f}% of a monitor width).")
+                           f"({100 * model.error_px / width:.0f}% of a monitor width).{detail}")
 
 
 class GazeDot(QWidget):
@@ -266,6 +293,247 @@ class GazeDot(QWidget):
         self.move(int(geo.x() + fx * geo.width() - self.SIZE / 2),
                   int(geo.y() + fy * geo.height() - self.SIZE / 2))
         self.show()
+
+
+ACTIONS = [("Press keys", "keys"), ("Click where I look", "click"), ("Pause / resume eyeSwitch", "toggle")]
+
+
+class TrainDialog(QDialog):
+    """Records a relaxed face, then the gesture, and trains the model from the two."""
+
+    def __init__(self, parent, engine, on_done):
+        super().__init__(parent)
+        self.setWindowTitle("Train gesture")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self.engine, self.on_done, self.finished_ = engine, on_done, False
+        self.relaxed = None
+        self.text = QLabel("Getting the camera ready...")
+        f = self.text.font()
+        f.setPointSize(f.pointSize() + 3)
+        f.setBold(True)
+        self.text.setFont(f)
+        self.text.setAlignment(Qt.AlignCenter)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.addWidget(self.text)
+        layout.addWidget(cancel)
+        engine.want_shapes = engine.calibrating = True       # camera on, blendshapes on, no auto focus
+        self.t0 = time.monotonic()
+        self.poll = QTimer(self)
+        self.poll.timeout.connect(self._ready)
+        self.poll.start(100)
+
+    def _ready(self):
+        if time.monotonic() - self.engine.shapes_seen < 0.5:
+            self.poll.stop()
+            self._say("Relax your face and look at the screen", 1500, self._start_relaxed)
+        elif time.monotonic() - self.t0 > 12:
+            self._finish(None, "No face data came from the camera. Is another app using it?")
+
+    def _say(self, text, delay_ms, then):
+        self.text.setText(text)
+        QTimer.singleShot(delay_ms, lambda: not self.finished_ and then())
+
+    def _start_relaxed(self):
+        self.engine.begin_shape_capture()
+        self.text.setText("Hold still... (relaxed)")
+        QTimer.singleShot(2000, lambda: not self.finished_ and self._end_relaxed())
+
+    def _end_relaxed(self):
+        self.relaxed = self.engine.end_shape_capture()
+        if len(self.relaxed) < 15:
+            return self._finish(None, "Your face was not detected. Face the camera and try again.")
+        self._say("Now make the gesture and HOLD it", 1500, self._start_gesture)
+
+    def _start_gesture(self):
+        self.engine.begin_shape_capture()
+        self.text.setText("Keep holding it...")
+        QTimer.singleShot(2500, lambda: not self.finished_ and self._end_gesture())
+
+    def _end_gesture(self):
+        shown = self.engine.end_shape_capture()
+        if len(shown) < 15:
+            return self._finish(None, "Your face was not detected. Face the camera and try again.")
+        self._finish(gestures.train(self.relaxed, shown), "")
+
+    def _finish(self, model, message):
+        if self.finished_:
+            return
+        self.finished_ = True
+        self.engine.want_shapes = self.engine.calibrating = False
+        self.accept()
+        self.on_done(model, message)
+
+    def reject(self):
+        if not self.finished_:
+            self.finished_ = True
+            self.engine.want_shapes = self.engine.calibrating = False
+        super().reject()
+
+
+class GestureRow(QWidget):
+    def __init__(self, dialog, binding):
+        super().__init__()
+        self.dialog, self.binding = dialog, binding
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.name = QLineEdit(binding["label"])
+        self.name.setFixedWidth(120)
+        self.action = QComboBox()
+        for label, value in ACTIONS:
+            self.action.addItem(label, value)
+        self.action.setCurrentIndex(max(self.action.findData(binding.get("action", "keys")), 0))
+        self.action.setMinimumWidth(200)
+        self.keys = QLineEdit(binding.get("keys", ""))
+        self.keys.setPlaceholderText("super, alt+tab, ctrl+shift+g")
+        self.keys.setFixedWidth(170)
+        self.hold = QSpinBox()
+        self.hold.setRange(100, 1500)
+        self.hold.setSingleStep(50)
+        self.hold.setSuffix(" ms")
+        self.hold.setValue(binding.get("hold_ms", 250))
+        self.hold.setToolTip("How long the gesture must be held")
+        self.hold.setFixedWidth(95)
+        self.train_btn = QPushButton("Train")
+        self.status = QLabel()
+        self.status.setFixedWidth(150)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 150)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedWidth(70)
+        self.bar.setToolTip("Live: fills past two thirds when the gesture is detected")
+        remove = QPushButton("\u2715")
+        remove.setFixedWidth(30)
+        for w in (self.name, self.action, self.keys, self.hold, self.train_btn, self.status, self.bar, remove):
+            row.addWidget(w)
+        self.name.editingFinished.connect(self._changed)
+        self.action.currentIndexChanged.connect(self._changed)
+        self.keys.editingFinished.connect(self._changed)
+        self.hold.valueChanged.connect(self._changed)
+        self.train_btn.clicked.connect(lambda: dialog.train(self))
+        remove.clicked.connect(lambda: dialog.remove(self))
+        self._changed()
+        self.show_status()
+
+    def _changed(self, *_):
+        b = self.binding
+        b["label"], b["action"] = self.name.text().strip() or "Gesture", self.action.currentData()
+        b["keys"], b["hold_ms"] = self.keys.text().strip(), self.hold.value()
+        self.keys.setEnabled(b["action"] == "keys")
+        self.dialog.engine.gestures_changed()
+
+    def show_status(self):
+        model = self.binding.get("model")
+        if not model:
+            self.status.setText("not trained")
+        else:
+            m = gestures.GestureModel.from_dict(model)
+            self.status.setText(("reliable" if m.reliable else "weak: retrain") + f" ({m.quality:.1f})")
+            self.status.setToolTip("Uses: " + ", ".join(m.names))
+
+
+class GesturesDialog(QDialog):
+    def __init__(self, parent, engine, cfg):
+        super().__init__(parent)
+        self.engine, self.g = engine, cfg["gestures"]
+        self.setWindowTitle("Gestures")
+        self.setMinimumWidth(920)
+        self.enabled = QCheckBox("Enable gestures")
+        self.enabled.setChecked(self.g["enabled"])
+        self.enabled.toggled.connect(self._enabled)
+        self.pause = QSpinBox()
+        self.pause.setRange(0, 30)
+        self.pause.setSuffix(" s")
+        self.pause.setValue(int(self.g.get("pause_s", 6)))
+        self.pause.valueChanged.connect(self._pause)
+        form = QFormLayout()
+        form.addRow("After a key gesture, don't switch focus automatically for", self.pause)
+        self.rows_box = QVBoxLayout()
+        add = QPushButton("Add gesture")
+        add.clicked.connect(self.add)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        self.log = QLabel()
+        self.log.setEnabled(False)
+        hint = QLabel("Train each gesture with your own face: relax, then do it and hold it. Eyebrows up "
+                      "works well; subtler ones (biting a lip) may come out as \u201cweak\u201d. "
+                      "Tip: raise your eyebrows for the Windows/Super key, then look at an app and use "
+                      "\u201cClick where I look\u201d on another gesture to pick it.")
+        hint.setWordWrap(True)
+        hint.setEnabled(False)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.addWidget(self.enabled)
+        layout.addLayout(form)
+        layout.addLayout(self.rows_box)
+        buttons = QHBoxLayout()
+        buttons.addWidget(add)
+        buttons.addStretch()
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        layout.addWidget(self.log)
+        layout.addWidget(hint)
+        self.rows = []
+        for b in self.g["bindings"]:
+            self._add_row(b)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._live)
+        self.timer.start(100)
+
+    def _add_row(self, binding):
+        row = GestureRow(self, binding)
+        self.rows.append(row)
+        self.rows_box.addWidget(row)
+
+    def add(self):
+        names = {b["label"] for b in self.g["bindings"]}
+        n = 1
+        while f"Gesture {n}" in names:
+            n += 1
+        b = {"label": f"Gesture {n}", "action": "keys", "keys": "super", "hold_ms": 250, "model": None}
+        self.g["bindings"].append(b)
+        self._add_row(b)
+        self.engine.gestures_changed()
+
+    def remove(self, row):
+        self.g["bindings"].remove(row.binding)
+        self.rows.remove(row)
+        row.setParent(None)
+        row.deleteLater()
+        self.engine.gestures_changed()
+        self.adjustSize()
+
+    def train(self, row):
+        TrainDialog(self, self.engine, lambda model, msg: self._trained(row, model, msg)).exec()
+
+    def _trained(self, row, model, message):
+        if model is None:
+            return QMessageBox.warning(self, "eyeSwitch", message)
+        row.binding["model"] = model.to_dict()
+        row.show_status()
+        self.engine.gestures_changed()
+        if not model.reliable:
+            QMessageBox.warning(self, "eyeSwitch", "This gesture looks too much like your relaxed face "
+                                "(separation %.1f). Try a bigger or more distinct movement and train it "
+                                "again; otherwise it will trigger by accident or not at all." % model.quality)
+
+    def _enabled(self, on):
+        self.g["enabled"] = on
+        self.engine.gestures_changed()
+
+    def _pause(self, value):
+        self.g["pause_s"] = value
+        self.engine.gestures_changed()
+
+    def _live(self):
+        for row in self.rows:
+            score = self.engine.gesture_scores.get(row.binding["label"])
+            live = self.g["enabled"] and row.binding.get("model") and score is not None
+            row.bar.setValue(int(max(0, min(150, score * 100))) if live else 0)
+        self.log.setText(self.engine.gesture_log)
 
 
 class Bridge(QObject):
@@ -311,6 +579,10 @@ class MainWindow(QWidget):
                                        "window_delay_ms")
         self.typing_wait = self._spin(QDoubleSpinBox(), 0, 10, 0.5, " s", cfg["typing_wait_s"],
                                       "typing_wait_s")
+        self.edge_px = self._spin(QSpinBox(), 0, 400, 10, " px", cfg["edge_px"], "edge_px")
+        self.edge_px.setSpecialValueText("auto")
+        self.edge_px.setToolTip("Keep the focus on the active window while your gaze is within this "
+                                "distance of it. Raise it if focus flickers between two windows.")
         self.show_gaze = QCheckBox("Show where it thinks I am looking (test dot)")
         self.show_gaze.setChecked(cfg["show_gaze"])
         self.show_gaze.toggled.connect(self._on_show_gaze)
@@ -343,6 +615,7 @@ class MainWindow(QWidget):
         self.form.addRow("Delay before switching monitor", self.delay)
         self.form.addRow("Delay before focusing a window", self.window_delay)
         self.form.addRow("Wait after typing", self.typing_wait)
+        self.form.addRow("Window edge tolerance", self.edge_px)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -354,6 +627,9 @@ class MainWindow(QWidget):
         layout.addWidget(self.vcam)
         layout.addWidget(self.vcam_note)
         layout.addWidget(self.autostart)
+        self.gestures_btn = QPushButton("Gestures...")
+        self.gestures_btn.clicked.connect(lambda: GesturesDialog(self, self.engine, self.cfg).exec())
+        layout.addWidget(self.gestures_btn)
         buttons = QHBoxLayout()
         buttons.addWidget(self.quick_btn)
         buttons.addWidget(self.full_btn)
@@ -397,7 +673,7 @@ class MainWindow(QWidget):
 
     def _apply_mode(self):
         window = self.cfg["mode"] == "window"
-        for w in (self.window_delay, self.typing_wait):
+        for w in (self.window_delay, self.typing_wait, self.edge_px):
             self.form.setRowVisible(w, window)
         self.show_gaze.setVisible(window)
         self.dot_timer.setInterval(50 if window and self.cfg["show_gaze"] else 400)

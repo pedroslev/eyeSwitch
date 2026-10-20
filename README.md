@@ -52,25 +52,53 @@ this folder or change Python environments. To run without installing: `python ey
 | Mode | What it does | Calibration |
 |------|--------------|-------------|
 | **Monitor only** (default) | Focus follows the monitor your head is turned to. | *Quick*: look at one dot per monitor, ~5 s each. |
-| **Monitor and window** | Focus follows the window you are looking at, on any monitor. | *Full*: follow a dot over a 3x3 grid on each monitor, ~35 s total. |
+| **Monitor and window** | Focus follows the window you are looking at, on any monitor. | *Full*: follow a dot over a 5x3 grid on each monitor, ~1 min total. |
 
 3. Keep it running. Closing the window hides it to the tray; Quit is in the tray menu.
 
 Window mode estimates where on the desktop you are looking from your head pose and the position
 of your irises. The full calibration fits that model and reports its estimated error (about 5% of a
-monitor width is typical for a webcam). Tick **Show where it thinks I am looking** to see the
+monitor width is typical for a webcam), for the centre of the screens and for their edges. It also
+saves `calibration_samples.npz` and `calibration_report.json` next to the settings, so a bad
+calibration can be analyzed. Tick **Show where it thinks I am looking** to see the
 estimate as a red dot while you tune it. In this mode the camera runs at 720p, because at 640x480 an eye is only ~20 px wide. It works best with big windows and a steady seat;
 redo the full calibration when you move the camera or change your posture a lot.
 The quick calibration discards a previous gaze model, since both describe the same setup.
 
 Settings: camera, mode, delay before switching monitor (default 300 ms), delay before focusing a
-window (500 ms), wait after typing (2 s: window mode never changes focus inside a monitor while you
+window (500 ms), window edge tolerance (keeps the focus on the active window while your gaze is within
+this distance of it, `auto` follows the gaze error; raise it if focus flickers between two windows), wait after typing (2 s: window mode never changes focus inside a monitor while you
 are typing), start at login. Ctrl+Shift+G pauses and resumes; while paused the camera is released.
 Nothing happens while you are using the mouse (and for 1.5 s after), and glances shorter than the
 delay are ignored. Recalibrate when you move the webcam or the monitors.
 
 Settings and calibration live in `~/.config/eyeswitch/` (Linux),
 `%APPDATA%\eyeSwitch` (Windows) or `~/Library/Application Support/eyeSwitch` (macOS).
+
+## Gestures
+
+**Gestures...** lets a facial expression press a key or click, using the face tracker's 52 expression
+signals (eyebrows, mouth, jaw...). Faces rest differently (and a camera angle skews everything), so
+each gesture is **trained on your face**: relax for 2 s, then do the gesture and hold it for 2.5 s.
+eyeSwitch keeps the few signals that tell the two apart and rates the result: *reliable* or *weak,
+retrain*. A live bar shows when it would trigger.
+
+Per gesture you choose what it does:
+
+- **Press keys**: `super`, `alt+tab`, `ctrl+shift+g`... (`win`, `cmd`, `meta` are all `super`).
+- **Click where I look**: moves the pointer to the point you are looking at and clicks (needs the
+  full calibration; otherwise it clicks where the pointer is).
+- **Pause / resume eyeSwitch.**
+
+A gesture fires once when held for its hold time (default 250 ms), and again only after the face
+relaxes. After a *key* gesture the automatic focus stays quiet for a few seconds (default 6), so it
+does not fight a menu or an overview you just opened. For example: raise your eyebrows (`super` opens
+the overview), look at an app, bite your lip (click where I look).
+
+Eyebrows up works well. Subtler ones, like biting a lip, depend on your face and may rate as weak.
+Expressions in conversation can trigger gestures by accident: give them a longer hold, or pause
+eyeSwitch with Ctrl+Shift+G during a call. Key and click injection uses XTEST (X11), SendInput
+(Windows) and Quartz events (macOS; needs the Accessibility permission).
 
 ## Video calls (sharing the camera)
 
@@ -103,7 +131,9 @@ cannot use it. What eyeSwitch does about it:
 - `camwatch.py` / `virtualcam.py`: step aside when another app opens the camera (inotify); republish
   the camera as a virtual one (pyvirtualcam, v4l2loopback).
 - `gaze.py`: ridge regression from those features to a desktop point, degree and regularization
-  chosen by leave-one-point-out cross-validation (this is also the error estimate).
+  chosen by leave-one-point-out cross-validation (this is also the error estimate); the simplest
+  model within 5% of the best wins, since complex ones overshoot at the screen edges.
+- `gestures.py`: trains a gesture from blendshapes (linear discriminant) and detects it live.
 - `backends/`: one module per OS behind the same interface (`base.py`): monitors, pointer,
   windows (focus, which one is under a point), typing detection, pause hotkey. `x11.py` uses RandR/EWMH, `windows.py` Win32 via ctypes,
   `macos.py` Quartz plus the Accessibility API.
@@ -119,8 +149,8 @@ Everything runs locally; frames are never stored.
 python -m unittest discover tests
 ```
 
-They cover the gaze fit, the face feature geometry, and the engine decisions, including camera
-sharing (fake camera, fake OS backend). Nothing in them touches your camera or your settings.
+They cover the gaze fit, gesture training and detection, the face feature geometry, and the engine
+decisions, including sticky window edges, gestures and camera sharing (fake camera, fake OS backend). Nothing in them touches your camera or your settings.
 
 ## Limits
 

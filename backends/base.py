@@ -9,6 +9,17 @@ from collections import namedtuple
 Monitor = namedtuple("Monitor", "x y w h")
 
 
+MODIFIERS = ("super", "ctrl", "shift", "alt")
+ALIASES = {"win": "super", "windows": "super", "cmd": "super", "command": "super", "meta": "super",
+           "control": "ctrl", "return": "enter", "escape": "esc", "option": "alt"}
+
+
+def parse_keys(text):
+    """'Win+Tab' -> ['super', 'tab'] (lowercase, aliases resolved)."""
+    keys = [k.strip().lower() for k in text.replace(",", "+").split("+") if k.strip()]
+    return [ALIASES.get(k, k) for k in keys]
+
+
 class BaseSession:
     def monitors(self):
         """[Monitor] sorted left to right."""
@@ -40,6 +51,19 @@ class BaseSession:
 
     def seconds_since_key(self):
         """Seconds since a typing key (not a modifier) was last seen pressed."""
+        raise NotImplementedError
+
+    def window_bounds(self, wid):
+        """(x, y, w, h) of the window, or None."""
+        raise NotImplementedError
+
+    def press_keys(self, keys):
+        """Press the keys together, then release them (names as returned by parse_keys).
+        Raises ValueError for a key it does not know."""
+        raise NotImplementedError
+
+    def click(self):
+        """Left click at the current pointer position."""
         raise NotImplementedError
 
     def exists(self, wid):

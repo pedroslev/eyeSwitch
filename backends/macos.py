@@ -98,6 +98,48 @@ class Session(BaseSession):
         return Quartz.CGEventSourceSecondsSinceLastEventType(
             Quartz.kCGEventSourceStateCombinedSessionState, Quartz.kCGEventKeyDown)
 
+    def window_bounds(self, wid):
+        w = self._find(wid)
+        return None if w is None else tuple(w[2])
+
+    # virtual key codes; "super" is the Command key
+    _KEYS = {"super": 55, "ctrl": 59, "shift": 56, "alt": 58, "enter": 36, "esc": 53, "tab": 48,
+             "space": 49, "left": 123, "right": 124, "down": 125, "up": 126, "backspace": 51,
+             "delete": 117, "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
+             **dict(zip("asdfhgzxcvbqweryt", (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17))),
+             **dict(zip("123465=9780", (18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 29))),   # row of digits
+             **dict(zip("-]o[uilpjk;", (27, 30, 31, 33, 32, 34, 37, 35, 38, 40, 41))),
+             **dict(zip("\\,/nm.", (42, 43, 44, 45, 46, 47))),
+             **{f"f{i}": k for i, k in enumerate((122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111), 1)}}
+    _FLAGS = {"super": Quartz.kCGEventFlagMaskCommand, "ctrl": Quartz.kCGEventFlagMaskControl,
+              "shift": Quartz.kCGEventFlagMaskShift, "alt": Quartz.kCGEventFlagMaskAlternate}
+
+    def press_keys(self, keys):
+        codes = []
+        for k in keys:
+            if k not in self._KEYS:
+                raise ValueError(f"unknown key: {k}")
+            codes.append(self._KEYS[k])
+        flags = 0
+
+        def post(code, down, flags):
+            ev = Quartz.CGEventCreateKeyboardEvent(None, code, down)
+            Quartz.CGEventSetFlags(ev, flags)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+
+        for k, code in zip(keys, codes):
+            flags |= self._FLAGS.get(k, 0)
+            post(code, True, flags)
+        for k, code in reversed(list(zip(keys, codes))):
+            post(code, False, flags)
+            flags &= ~self._FLAGS.get(k, 0)
+
+    def click(self):
+        x, y = self.pointer()
+        for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+
     def activate(self, wid):
         w = self._find(wid)
         if w is None:
