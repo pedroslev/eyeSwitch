@@ -14,7 +14,8 @@ Lessons from real calibration data, each one now enforced here:
 """
 import numpy as np
 
-DEGREES = (1, 2)
+DEGREES = (1,)       # quadratic added nothing on two real calibrations (166 px either way), and choosing between
+                     # the two by cross-validation was worse than either (177 px): with ~30 dots that choice is noise
 ALPHAS = (1e-3, 1e-2, 1e-1, 1.0)         # scaled by the number of samples
 SIMPLICITY = 1.05                       # accept a simpler model this much worse than the best
 MIN_SNR = 2.0                            # a feature must vary this much more between points than within one

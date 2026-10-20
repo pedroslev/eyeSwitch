@@ -92,15 +92,20 @@ refine it. Things learned the hard way with real calibration data, all covered b
 - **Frames where the head is still travelling** between dots are dropped, and the dots come in
   **random order**, because in a fixed sweep where the head points for a given dot depends on where
   it came from (about 5 degrees of yaw in real data).
-- **Two feature sets compete** (head pose and iris, with and without the nose); cross-validation picks
-  one, preferring the smaller on a tie. Features without information are dropped, inputs are clamped to
-  the calibrated range, and if your pose leaves that range (the camera or your chair moved) eyeSwitch
-  says so and does nothing instead of acting on a meaningless estimate.
+- **The model is linear on four signals**: yaw, pitch and the iris offset (h, v). A nose cue was tried in
+  two calibrations and never helped (120 vs 125 px, 166 vs 169 px), and quadratic gave the same accuracy
+  (166 px both) while letting cross-validation choose between the two was *worse* (177 px): with about 30
+  dots that choice is noise. Features without information are dropped, inputs are clamped to the
+  calibrated range, and if your pose leaves that range (the camera or your chair moved) eyeSwitch says
+  so and does nothing instead of acting on a meaningless estimate.
 - **The output is steadied with a fixation filter** (the I-DT idea from eye tracking): while you fixate,
   the point stays put, and it moves once several consecutive frames agree on a new place. Its radius
   comes from the noise measured during your calibration. It beat a median+EMA filter on both jitter and
   lag on real data.
 - **Calibration is tied to where the camera sits.** Move the camera and recalibrate.
+- **Your posture drifts while you calibrate**: in one measurement the vertical estimate slid by about 85 px
+  over the ~1 minute the 36 dots take. Sit as you normally do and stay put; that is why each dot is sampled
+  for as little as 30 fps allows (0.6 s).
 
 What was tried on real calibration data (36 dots, leave-one-dot-out error; the current model scores
 120 px, 84 px on the held-out check dots) and did **not** help, so it is not in the code:
@@ -110,7 +115,7 @@ What was tried on real calibration data (36 dots, leave-one-dot-out error; the c
 | Iris offset in the head's own frame, built from the landmarks' depth | much worse (214 px): the landmark z is too noisy |
 | Each eye separately, roll, nose cue, a distance proxy, eyelid opening, iris between the lids | within noise (117-125 px) |
 | tan() of the angles (a pinhole-camera model), one model per monitor, kernel ridge | same or worse |
-| Quadratic instead of linear | same (the fit picks linear on its own) |
+| Quadratic instead of linear | same accuracy (166 px both); picking between them by cross-validation was worse (177 px), so it is always linear |
 | Head pose only, no irises | 282 px: the irises cut the error by more than half |
 | 1080p instead of 720p | 7-32% less noise in pitch and iris offset (little in yaw and vertical iris); costs about 20% of one CPU core more (78% against 58% of a core at 15 fps) |
 

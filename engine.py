@@ -63,8 +63,11 @@ ACTIVITY_SHARE = 0.35   # the estimate is this share of the fixation radius off 
 # (tx, ty, tz) is deliberately absent: it says where you sit, not where you look, and a model fitted
 # with it moved the estimate ~1000 px per cm of seat shift while being less accurate.
 _F = Face._fields
-GAZE_COLUMN_SETS = [[_F.index(n) for n in names] for names in (
-    ("yaw", "pitch", "h", "v"), ("yaw", "pitch", "h", "v", "nx", "ny"))]
+GAZE_COLUMN_SETS = [[_F.index(n) for n in ("yaw", "pitch", "h", "v")]]
+# A nose cue (nx, ny) used to compete with this set; on two real calibrations it never helped (120 vs 125 px,
+# 166 vs 169 px) and letting cross-validation choose between sets only added noise. It is still measured and
+# saved with each calibration, for offline experiments.
+
 # Steadiness level -> (seconds a new place must hold before the decision point moves, radius factor).
 # In seconds, not frames: the frame rate is a setting. Level 3 is 0.2 s (it was 4 frames = 0.27 s at 15 fps).
 STABILITY = {1: (0.10, 0.8), 2: (0.15, 0.9), 3: (0.20, 1.0), 4: (0.27, 1.1), 5: (0.35, 1.25)}

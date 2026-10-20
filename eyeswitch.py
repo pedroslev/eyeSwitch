@@ -220,7 +220,7 @@ class FullCalibration(CalibrationBase):
     yaw in real data), which the fit then mistakes for a property of the position.
     """
 
-    SETTLE_MS, SAMPLE_MS, INTRO_MS, CHECK_MS = 700, 900, 1800, 1200
+    SETTLE_MS, SAMPLE_MS, INTRO_MS, CHECK_MS = 700, 600, 1800, 1200
     TARGET_CLEAN, MAX_SAMPLE_MS = 10, 3000           # keep sampling until this many clean frames, up to this long
     CHECKS = ((0.17, 0.30), (0.62, 0.70), (0.83, 0.30))
     MIN_CLEAN = 6                                    # clean frames a dot needs to count
