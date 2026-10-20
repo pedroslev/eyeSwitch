@@ -6,10 +6,10 @@ import time
 
 import numpy as np
 
+import backends
 from tracker import HeadTracker
-from xwin import XSession
 
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "eyeswitch")
+CONFIG_DIR = backends.config_dir()
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 CALIB_PATH = os.path.join(CONFIG_DIR, "calibration.json")
 DEFAULTS = {"camera": 0, "delay_ms": 300, "enabled": True}
@@ -32,22 +32,6 @@ def save_config(cfg):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
-
-
-def list_cameras():
-    """[(index, name)] of V4L2 capture devices (skips the metadata nodes)."""
-    out = []
-    base = "/sys/class/video4linux"
-    for dev in sorted(os.listdir(base) if os.path.isdir(base) else []):
-        try:
-            with open(f"{base}/{dev}/index") as f:
-                if f.read().strip() != "0":
-                    continue
-            with open(f"{base}/{dev}/name") as f:
-                out.append((int(dev.removeprefix("video")), f.read().strip()))
-        except (OSError, ValueError):
-            continue
-    return sorted(out)
 
 
 def pick_target(yaw, centers, current):
@@ -81,7 +65,7 @@ class Engine:
         self.yaw = None                 # smoothed head yaw in degrees, None when no face
         self.calibrating = False
         self.on_change = None           # called from the worker thread when `enabled` flips
-        self.monitors = XSession().monitors()
+        self.monitors = backends.Session().monitors()
         self.centers, self.calib_monitors = None, None
         self._capture = None
         self._lock = threading.Lock()
@@ -132,10 +116,10 @@ class Engine:
     # --- worker ------------------------------------------------------------
     def _run(self):
         try:
-            xs = XSession()
+            xs = backends.Session()
             hotkey_ok = xs.grab_hotkey()
         except Exception as e:
-            self.status = f"Cannot talk to X11: {e}"
+            self.status = f"Cannot start the {backends.platform_name()} backend: {e}"
             return
         tracker, opened = None, None
         last_window, last_pointer = {}, {}

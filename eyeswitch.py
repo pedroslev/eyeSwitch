@@ -1,72 +1,88 @@
 #!/usr/bin/env python3
-"""eyeSwitch: move keyboard focus to the monitor you are facing (webcam, X11)."""
-import importlib
+"""eyeSwitch: move keyboard focus to the monitor you are facing (webcam)."""
+import ctypes.util
 import os
 import statistics
+import subprocess
 import sys
 
-import gi
-
-gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
-
-from engine import Engine, list_cameras, load_config, save_config  # noqa: E402
-
-APP_ID = "io.github.pedroslev.eyeSwitch"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "data")
-AUTOSTART = os.path.join(GLib.get_user_config_dir(), "autostart", "eyeswitch.desktop")
-TRAY_HINT = "sudo apt install gir1.2-ayatanaappindicator3-0.1"
+SINGLE_INSTANCE = "eyeswitch-single-instance"
 
-AppIndicator = None
-for _ns in ("AyatanaAppIndicator3", "AppIndicator3"):
+
+def check_linux_qt_deps():
+    """Qt >= 6.5 aborts without libxcb-cursor; say so instead of dying silently."""
+    if (not sys.platform.startswith("linux") or os.environ.get("QT_QPA_PLATFORM")
+            or ctypes.util.find_library("xcb-cursor")):
+        return
+    msg = ("eyeSwitch needs the libxcb-cursor library.\n"
+           "Debian/Ubuntu: sudo apt install libxcb-cursor0\n"
+           "Fedora: sudo dnf install xcb-util-cursor\n"
+           "Arch: sudo pacman -S xcb-util-cursor\n"
+           "openSUSE: sudo zypper install libxcb-cursor0")
+    print(msg, file=sys.stderr)
     try:
-        gi.require_version(_ns, "0.1")
-        AppIndicator = importlib.import_module("gi.repository." + _ns)
-        break
-    except (ValueError, ImportError):
-        continue
+        subprocess.run(["notify-send", "-i", "dialog-error", "eyeSwitch cannot start", msg], timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    sys.exit(1)
 
 
-class CalibrationWindow(Gtk.Window):
-    """Fullscreen black window with one dot, shown on a given monitor."""
+check_linux_qt_deps()
 
-    def __init__(self, mon, on_cancel):
-        super().__init__(title="eyeSwitch calibration")
-        self.text = ""
-        self.set_decorated(False)
-        self.set_keep_above(True)
-        area = Gtk.DrawingArea()
-        area.connect("draw", self._draw)
-        self.add(area)
-        self.connect("key-press-event", lambda w, e: e.keyval == Gdk.KEY_Escape and on_cancel())
-        display = Gdk.Display.get_default()
-        for n in range(display.get_n_monitors()):
-            g = display.get_monitor(n).get_geometry()
-            if (g.x, g.y) == (mon.x, mon.y):
-                self.fullscreen_on_monitor(display.get_default_screen(), n)
-                break
-        else:
-            self.move(mon.x, mon.y)
-            self.fullscreen()
+from PySide6.QtCore import QObject, QPointF, Qt, QTimer, Signal  # noqa: E402
+from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter  # noqa: E402
+from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFormLayout, QLabel,  # noqa: E402
+                               QMenu, QMessageBox, QPushButton, QSpinBox, QSystemTrayIcon,
+                               QVBoxLayout, QWidget)
+
+import autostart  # noqa: E402
+import backends  # noqa: E402
+from engine import Engine, load_config, save_config  # noqa: E402
+from tracker import list_cameras  # noqa: E402
+
+
+def icon(name):
+    return QIcon(os.path.join(DATA_DIR, name))
+
+
+def screen_for_monitor(i, count):
+    """Qt screen matching the i-th monitor from left to right."""
+    screens = sorted(QGuiApplication.screens(), key=lambda s: (s.geometry().x(), s.geometry().y()))
+    return screens[i] if len(screens) == count else QGuiApplication.primaryScreen()
+
+
+class CalibrationWindow(QWidget):
+    """Fullscreen black window with one dot, shown on a given screen."""
+
+    def __init__(self, screen, on_cancel):
+        super().__init__()
+        self.text, self.on_cancel = "", on_cancel
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setScreen(screen)
+        self.setGeometry(screen.geometry())
 
     def set_text(self, text):
         self.text = text
-        self.queue_draw()
+        self.update()
 
-    def _draw(self, widget, cr):
-        w, h = widget.get_allocated_width(), widget.get_allocated_height()
-        cr.set_source_rgb(0, 0, 0)
-        cr.paint()
-        cr.set_source_rgb(1, 0.78, 0)
-        cr.arc(w / 2, h / 2, 18, 0, 6.2832)
-        cr.fill()
-        cr.set_source_rgb(1, 1, 1)
-        cr.set_font_size(32)
-        ext = cr.text_extents(self.text)
-        cr.move_to(w / 2 - ext.width / 2, h / 2 - 70)
-        cr.show_text(self.text)
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.on_cancel()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), Qt.black)
+        c = QPointF(self.width() / 2, self.height() / 2)
+        p.setBrush(QColor(255, 200, 0))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(c, 18, 18)
+        p.setPen(Qt.white)
+        p.setFont(QFont(self.font().family(), 24))
+        rect = self.rect().adjusted(0, 0, 0, -int(self.height() / 2 + 60))
+        p.drawText(rect, Qt.AlignHCenter | Qt.AlignBottom, self.text)
 
 
 class Calibration:
@@ -85,255 +101,253 @@ class Calibration:
     def _finish(self, ok, message):
         self.engine.calibrating = False
         if self.win:
-            self.win.destroy()
+            self.win.close()
+            self.win = None
         self.on_done(ok, message)
 
     def _step(self):
         if self.cancelled:
             return self._finish(False, "Calibration cancelled.")
-        if self.i == len(self.monitors):
-            gaps = [abs(a - b) for a, b in zip(sorted(self.yaws), sorted(self.yaws)[1:])]
-            if min(gaps) < 5:
+        n = len(self.monitors)
+        if self.i == n:
+            s = sorted(self.yaws)
+            if min(b - a for a, b in zip(s, s[1:])) < 5:
                 return self._finish(False, "The head angle between monitors is under 5 degrees. "
                                            "Turn your head more clearly towards each dot.")
             self.engine.set_calibration(self.yaws, self.monitors)
             return self._finish(True, "Calibration saved.")
-        self.win = CalibrationWindow(self.monitors[self.i], self.cancel)
-        self.win.set_text(f"Monitor {self.i + 1} of {len(self.monitors)}: look at the dot")
-        self.win.show_all()
-        GLib.timeout_add(2500, self._begin_capture)
+        self.win = CalibrationWindow(screen_for_monitor(self.i, n), self.cancel)
+        self.win.set_text(f"Monitor {self.i + 1} of {n}: look at the dot")
+        self.win.showFullScreen()
+        self.win.activateWindow()
+        QTimer.singleShot(2500, self._begin_capture)
 
     def _begin_capture(self):
         if self.cancelled:
-            return self._finish(False, "Calibration cancelled.") or False
+            return self._finish(False, "Calibration cancelled.")
         self.engine.begin_capture()
         self.win.set_text("Hold still...")
-        GLib.timeout_add(2500, self._end_capture)
-        return False
+        QTimer.singleShot(2500, self._end_capture)
 
     def _end_capture(self):
         samples = self.engine.end_capture()
-        self.win.destroy()
+        self.win.close()
         self.win = None
         if self.cancelled:
-            return self._finish(False, "Calibration cancelled.") or False
+            return self._finish(False, "Calibration cancelled.")
         if len(samples) < 10:
-            return self._finish(False, f"No face detected while looking at monitor {self.i + 1}.") or False
+            return self._finish(False, f"No face detected while looking at monitor {self.i + 1}.")
         self.yaws.append(statistics.median(samples))
         self.i += 1
-        GLib.idle_add(self._step)
-        return False
+        QTimer.singleShot(0, self._step)
 
 
-class MainWindow(Gtk.ApplicationWindow):
-    def __init__(self, app, engine, cfg):
-        super().__init__(application=app, title="eyeSwitch")
-        self.engine, self.cfg, self.app = engine, cfg, app
+class Bridge(QObject):
+    """Lets the engine thread poke the GUI thread."""
+    enabled_changed = Signal()
+
+
+class MainWindow(QWidget):
+    def __init__(self, app, engine, cfg, tray):
+        super().__init__()
+        self.app, self.engine, self.cfg, self.tray = app, engine, cfg, tray
         self.calibration = None
-        self.set_default_size(380, -1)
-        self.set_resizable(False)
-        self._syncing = False
+        self.setWindowTitle("eyeSwitch")
+        self.setWindowIcon(icon("eyeswitch.svg"))
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=18)
-        self.add(box)
+        self.status = QLabel()
+        f = self.status.font()
+        f.setPointSize(f.pointSize() + 4)
+        f.setBold(True)
+        self.status.setFont(f)
+        self.detail = QLabel()
+        self.detail.setEnabled(False)           # dimmed text
 
-        self.status = Gtk.Label(xalign=0)
-        self.status.get_style_context().add_class("title-3")
-        self.detail = Gtk.Label(xalign=0)
-        self.detail.get_style_context().add_class("dim-label")
-        box.pack_start(self.status, False, False, 0)
-        box.pack_start(self.detail, False, False, 0)
+        self.enabled = QCheckBox("Active  (Ctrl+Shift+G)")
+        self.enabled.setChecked(cfg["enabled"])
+        self.enabled.toggled.connect(engine.set_enabled)
 
-        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
-        box.pack_start(grid, False, False, 0)
+        self.camera = QComboBox()
+        for idx, name in list_cameras():
+            self.camera.addItem(f"{name} ({idx})" if sys.platform != "linux" else
+                                f"{name} (/dev/video{idx})", idx)
+        pos = self.camera.findData(cfg["camera"])
+        self.camera.setCurrentIndex(max(pos, 0))
+        self.camera.currentIndexChanged.connect(self._on_camera)
 
-        self.enabled = Gtk.Switch(halign=Gtk.Align.END)
-        self.enabled.connect("notify::active", self._on_enabled)
-        self._row(grid, 0, "Active  (Ctrl+Shift+G)", self.enabled)
+        self.delay = QSpinBox()
+        self.delay.setRange(100, 2000)
+        self.delay.setSingleStep(50)
+        self.delay.setSuffix(" ms")
+        self.delay.setValue(cfg["delay_ms"])
+        self.delay.valueChanged.connect(self._on_delay)
 
-        self.camera = Gtk.ComboBoxText()
-        self.cameras = list_cameras()
-        for idx, name in self.cameras:
-            self.camera.append(str(idx), f"{name} (/dev/video{idx})")
-        self.camera.set_active_id(str(cfg["camera"]))
-        self.camera.connect("changed", self._on_camera)
-        self._row(grid, 1, "Camera", self.camera)
+        self.autostart = QCheckBox("Start at login")
+        self.autostart.setChecked(autostart.is_enabled())
+        self.autostart.toggled.connect(autostart.set_enabled)
 
-        self.delay = Gtk.SpinButton.new_with_range(100, 2000, 50)
-        self.delay.set_value(cfg["delay_ms"])
-        self.delay.connect("value-changed", self._on_delay)
-        self._row(grid, 2, "Delay before switching (ms)", self.delay)
+        self.calibrate_btn = QPushButton("Calibrate")
+        self.calibrate_btn.clicked.connect(self._on_calibrate)
 
-        self.autostart = Gtk.Switch(halign=Gtk.Align.END, active=os.path.exists(AUTOSTART))
-        self.autostart.connect("notify::active", self._on_autostart)
-        self._row(grid, 3, "Start at login", self.autostart)
+        form = QFormLayout()
+        form.addRow("Camera", self.camera)
+        form.addRow("Delay before switching", self.delay)
 
-        self.calibrate_btn = Gtk.Button(label="Calibrate")
-        self.calibrate_btn.get_style_context().add_class("suggested-action")
-        self.calibrate_btn.connect("clicked", self._on_calibrate)
-        box.pack_start(self.calibrate_btn, False, False, 0)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 18)
+        for w in (self.status, self.detail, self.enabled):
+            layout.addWidget(w)
+        layout.addLayout(form)
+        layout.addWidget(self.autostart)
+        layout.addWidget(self.calibrate_btn)
+        warning = backends.unsupported_reason() or ("" if tray else
+                                                    "No system tray available: closing this window quits the app.")
+        if warning:
+            note = QLabel(warning)
+            note.setWordWrap(True)
+            note.setEnabled(False)
+            layout.addWidget(note)
 
-        if AppIndicator is None:
-            hint = Gtk.Label(xalign=0, wrap=True, selectable=True,
-                             label=f"No tray icon support. Closing this window quits the app.\n"
-                                   f"To get the tray icon: {TRAY_HINT}")
-            hint.get_style_context().add_class("dim-label")
-            box.pack_start(hint, False, False, 0)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(300)
+        self.refresh()
+        self.setMinimumWidth(400)
 
-        self.connect("delete-event", self._on_close)
-        box.show_all()                  # present() alone shows an empty window
-        self.sync()
-        GLib.timeout_add(300, self._refresh)
+    def sync_enabled(self):
+        """Pull `enabled` from config (hotkey or tray changed it)."""
+        self.enabled.blockSignals(True)
+        self.enabled.setChecked(self.cfg["enabled"])
+        self.enabled.blockSignals(False)
 
-    @staticmethod
-    def _row(grid, row, label, widget):
-        lbl = Gtk.Label(label=label, xalign=0, hexpand=True)
-        grid.attach(lbl, 0, row, 1, 1)
-        grid.attach(widget, 1, row, 1, 1)
-
-    def sync(self):
-        """Pull `enabled` from the engine config into the switch (hotkey, tray)."""
-        self._syncing = True
-        self.enabled.set_active(self.cfg["enabled"])
-        self._syncing = False
-
-    def _refresh(self):
+    def refresh(self):
         e = self.engine
-        self.status.set_text(e.status)
+        self.status.setText(e.status)
         if e.calibrated:
-            yaws = ", ".join(f"M{i + 1} {y:+.0f}°" for i, y in enumerate(e.centers))
-            cal = f"Calibrated ({yaws})"
+            cal = "Calibrated (" + ", ".join(f"M{i + 1} {y:+.0f}°" for i, y in enumerate(e.centers)) + ")"
         elif e.centers is not None:
             cal = "Monitor layout changed: recalibrate"
         else:
             cal = "Not calibrated yet"
         yaw = "no face" if e.yaw is None else f"{e.yaw:+.1f}°"
-        self.detail.set_text(f"Head yaw: {yaw}  |  {cal}")
-        self.app.update_tray()
-        return True
+        self.detail.setText(f"Head yaw: {yaw}  |  {cal}")
 
-    def _on_enabled(self, sw, _):
-        if not self._syncing:
-            self.engine.set_enabled(sw.get_active())
-
-    def _on_camera(self, combo):
-        self.cfg["camera"] = int(combo.get_active_id())
+    def _on_camera(self, _i):
+        self.cfg["camera"] = self.camera.currentData()
         save_config(self.cfg)
 
-    def _on_delay(self, spin):
-        self.cfg["delay_ms"] = int(spin.get_value())
+    def _on_delay(self, value):
+        self.cfg["delay_ms"] = value
         save_config(self.cfg)
 
-    def _on_autostart(self, sw, _):
-        if sw.get_active():
-            os.makedirs(os.path.dirname(AUTOSTART), exist_ok=True)
-            with open(AUTOSTART, "w") as f:
-                f.write("[Desktop Entry]\nType=Application\nName=eyeSwitch\nIcon=eyeswitch\n"
-                        f"Exec={sys.executable} {os.path.join(HERE, 'eyeswitch.py')} --background\n"
-                        "X-GNOME-Autostart-enabled=true\n")
-        elif os.path.exists(AUTOSTART):
-            os.remove(AUTOSTART)
-
-    def _on_calibrate(self, _btn):
+    def _on_calibrate(self):
         if len(self.engine.monitors) < 2:
-            return self._message("Only one monitor detected.")
-        self.calibrate_btn.set_sensitive(False)
+            return self._message("Only one monitor detected.", QMessageBox.Warning)
+        self.calibrate_btn.setEnabled(False)
         self.calibration = Calibration(self.engine, self._calibration_done)
 
     def _calibration_done(self, ok, message):
         self.calibration = None
-        self.calibrate_btn.set_sensitive(True)
-        self.present()
-        self._message(message, Gtk.MessageType.INFO if ok else Gtk.MessageType.WARNING)
+        self.calibrate_btn.setEnabled(True)
+        self.show_window()
+        self._message(message, QMessageBox.Information if ok else QMessageBox.Warning)
 
-    def _message(self, text, kind=Gtk.MessageType.WARNING):
-        dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=kind,
-                                buttons=Gtk.ButtonsType.OK, text=text)
-        dlg.run()
-        dlg.destroy()
+    def _message(self, text, kind):
+        box = QMessageBox(kind, "eyeSwitch", text, QMessageBox.Ok, self)
+        box.exec()
 
-    def _on_close(self, *_):
-        if AppIndicator is None:
-            self.app.quit_app()
-        else:
+    def show_window(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event):
+        if self.tray:
+            event.ignore()
             self.hide()
+        else:
+            self.app.quit()
+
+
+def build_tray(window, engine, cfg, app):
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        return None
+    tray = QSystemTrayIcon(icon("eyeswitch-tray.svg"), app)
+    menu = QMenu()
+    open_action = QAction("Open eyeSwitch", menu)
+    open_action.triggered.connect(lambda: window.show_window())
+    active = QAction("Active", menu, checkable=True)
+    active.setChecked(cfg["enabled"])
+    active.toggled.connect(engine.set_enabled)
+    quit_action = QAction("Quit", menu)
+    quit_action.triggered.connect(app.quit)
+    for a in (open_action, active):
+        menu.addAction(a)
+    menu.addSeparator()
+    menu.addAction(quit_action)
+    tray.setContextMenu(menu)
+    tray.setToolTip("eyeSwitch")
+    tray.activated.connect(lambda reason: reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick)
+                           and window.show_window())
+
+    def sync():
+        on = cfg["enabled"]
+        tray.setIcon(icon("eyeswitch-tray.svg" if on else "eyeswitch-tray-paused.svg"))
+        active.blockSignals(True)
+        active.setChecked(on)
+        active.blockSignals(False)
+
+    tray.sync = sync
+    tray.show()
+    return tray
+
+
+def already_running():
+    """Ask a running instance to show its window. True if there was one."""
+    sock = QLocalSocket()
+    sock.connectToServer(SINGLE_INSTANCE)
+    if sock.waitForConnected(300):
+        sock.write(b"show")
+        sock.waitForBytesWritten(300)
         return True
-
-
-class EyeSwitchApp(Gtk.Application):
-    def __init__(self, background):
-        super().__init__(application_id=APP_ID)
-        self.background = background
-        self.window = self.engine = self.indicator = None
-
-    def do_activate(self):
-        if self.window is None:
-            self.cfg = load_config()
-            if os.environ.get("XDG_SESSION_TYPE") == "wayland":
-                print("warning: Wayland session; focus control only works on X11", file=sys.stderr)
-            self.engine = Engine(self.cfg)
-            self.hold()
-            self.window = MainWindow(self, self.engine, self.cfg)
-            self.engine.on_change = lambda: GLib.idle_add(self._on_engine_change)
-            self._build_tray()
-            if self.background and AppIndicator is not None:
-                return
-        self.window.present()
-
-    def _build_tray(self):
-        if AppIndicator is None:
-            return
-        self.indicator = AppIndicator.Indicator.new(
-            "eyeswitch", "eyeswitch-tray", AppIndicator.IndicatorCategory.APPLICATION_STATUS)
-        self.indicator.set_icon_theme_path(DATA_DIR)
-        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
-        menu = Gtk.Menu()
-        open_item = Gtk.MenuItem(label="Open eyeSwitch")
-        open_item.connect("activate", lambda *_: self.window.present())
-        self.pause_item = Gtk.CheckMenuItem(label="Active")
-        self.pause_item.connect("toggled", self._on_tray_toggle)
-        quit_item = Gtk.MenuItem(label="Quit")
-        quit_item.connect("activate", lambda *_: self.quit_app())
-        for item in (open_item, self.pause_item, Gtk.SeparatorMenuItem(), quit_item):
-            menu.append(item)
-        menu.show_all()
-        self.indicator.set_menu(menu)
-        self.update_tray()
-
-    def update_tray(self):
-        if self.indicator is None:
-            return
-        enabled = self.cfg["enabled"]
-        self.indicator.set_icon_full("eyeswitch-tray" if enabled else "eyeswitch-tray-paused",
-                                     "eyeSwitch")
-        if self.pause_item.get_active() != enabled:
-            self.pause_item.handler_block_by_func(self._on_tray_toggle)
-            self.pause_item.set_active(enabled)
-            self.pause_item.handler_unblock_by_func(self._on_tray_toggle)
-
-    def _on_tray_toggle(self, item):
-        self.engine.set_enabled(item.get_active())
-
-    def _on_engine_change(self):
-        self.window.sync()
-        self.update_tray()
-        return False
-
-    def quit_app(self):
-        if self.engine:
-            self.engine.stop()
-        self.quit()
+    return False
 
 
 def main():
-    GLib.set_prgname("eyeswitch")
-    GLib.set_application_name("eyeSwitch")
     background = "--background" in sys.argv
-    Gtk.IconTheme.get_default().append_search_path(DATA_DIR)
-    Gtk.Window.set_default_icon_name("eyeswitch")
-    app = EyeSwitchApp(background)
-    sys.exit(app.run([sys.argv[0]]))
+    app = QApplication([sys.argv[0]])       # first: Qt sets DPI awareness on Windows
+    app.setApplicationName("eyeSwitch")
+    app.setDesktopFileName("eyeswitch")
+    app.setWindowIcon(icon("eyeswitch.svg"))
+    app.setQuitOnLastWindowClosed(False)
+
+    if already_running():
+        return 0
+    QLocalServer.removeServer(SINGLE_INSTANCE)
+    server = QLocalServer()
+    server.listen(SINGLE_INSTANCE)
+
+    cfg = load_config()
+    engine = Engine(cfg)
+    bridge = Bridge()
+    engine.on_change = bridge.enabled_changed.emit
+    window = MainWindow(app, engine, cfg, QSystemTrayIcon.isSystemTrayAvailable())
+    tray = build_tray(window, engine, cfg, app)
+
+    def on_enabled_changed():
+        window.sync_enabled()
+        if tray:
+            tray.sync()
+
+    bridge.enabled_changed.connect(on_enabled_changed, Qt.QueuedConnection)
+    server.newConnection.connect(lambda: (server.nextPendingConnection(), window.show_window()))
+    app.aboutToQuit.connect(engine.stop)
+    on_enabled_changed()
+    if not (background and tray):
+        window.show_window()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

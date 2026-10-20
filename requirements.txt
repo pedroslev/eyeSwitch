@@ -1,4 +1,8 @@
 mediapipe
 opencv-python-headless
 numpy
-python-xlib
+PySide6
+python-xlib; sys_platform == "linux"
+pyobjc-framework-Quartz; sys_platform == "darwin"
+pyobjc-framework-Cocoa; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices; sys_platform == "darwin"

@@ -1,6 +1,7 @@
 """Webcam head-yaw tracking with MediaPipe Face Landmarker."""
 import math
 import os
+import sys
 import time
 import urllib.request
 
@@ -15,6 +16,38 @@ MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
 
 
+def _capture_api():
+    if sys.platform.startswith("win"):
+        return cv2.CAP_DSHOW            # MSMF is very slow to open
+    if sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
+    return cv2.CAP_V4L2
+
+
+def list_cameras():
+    """[(index, name)] of cameras. Linux knows names; elsewhere the indexes are probed."""
+    base = "/sys/class/video4linux"
+    if os.path.isdir(base):
+        out = []
+        for dev in sorted(os.listdir(base)):
+            try:
+                with open(f"{base}/{dev}/index") as f:
+                    if f.read().strip() != "0":      # skip metadata nodes
+                        continue
+                with open(f"{base}/{dev}/name") as f:
+                    out.append((int(dev.removeprefix("video")), f.read().strip()))
+            except (OSError, ValueError):
+                continue
+        return sorted(out)
+    out = []
+    for i in range(4):
+        cap = cv2.VideoCapture(i, _capture_api())
+        if cap.isOpened():
+            out.append((i, f"Camera {i}"))
+        cap.release()
+    return out
+
+
 def ensure_model():
     if not os.path.exists(MODEL_PATH):
         print("Downloading face landmarker model...")
@@ -24,7 +57,7 @@ def ensure_model():
 class HeadTracker:
     def __init__(self, camera=0, width=640, height=480, fps=15):
         ensure_model()
-        self.cap = cv2.VideoCapture(camera, cv2.CAP_V4L2)
+        self.cap = cv2.VideoCapture(camera, _capture_api())
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)

@@ -1,13 +1,11 @@
-"""X11 helpers: monitors, window focus, pointer, global pause hotkey."""
-from collections import namedtuple
-
+"""X11 backend: RandR monitors, EWMH window focus, pointer warp, XGrabKey hotkey."""
 from Xlib import X, XK, display, protocol
 from Xlib.error import CatchError
 
-Monitor = namedtuple("Monitor", "x y w h")
+from .base import BaseSession, Monitor
 
 
-class XSession:
+class Session(BaseSession):
     def __init__(self):
         self.d = display.Display()
         self.root = self.d.screen().root
@@ -26,13 +24,6 @@ class XSession:
         ms = self.root.xrandr_get_monitors().monitors
         out = [Monitor(m.x, m.y, m.width_in_pixels, m.height_in_pixels) for m in ms]
         return sorted(out, key=lambda m: m.x)
-
-    @staticmethod
-    def monitor_at(monitors, x, y):
-        for i, m in enumerate(monitors):
-            if m.x <= x < m.x + m.w and m.y <= y < m.y + m.h:
-                return i
-        return None
 
     # --- pointer -----------------------------------------------------------
     def pointer(self):
