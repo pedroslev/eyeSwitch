@@ -91,6 +91,8 @@ class FakeTracker:
         FakeTracker.opens += 1
         FakeTracker.args = (camera, sink is not None)
         FakeTracker.height_asked, FakeTracker.fps_asked = height, fps
+        self.max_fps, self.camera_fps = fps, 50.0
+        FakeTracker.rate = fps
         self.height = 1080 if height == "auto" else height     # what a 1080p camera would deliver
         FakeTracker.shapes_on = blendshapes
         self.sink = sink
@@ -112,6 +114,9 @@ class FakeTracker:
         if self.sink:
             self.sink("frame")
         return FakeTracker.face, FakeTracker.frame
+
+    def set_rate(self, fps):
+        FakeTracker.rate = fps
 
     def raw(self):
         return np.zeros((478, 3), np.float32), np.eye(4, dtype=np.float32), (64, 48), {"eyeLookUpLeft": 0.1}
@@ -183,6 +188,7 @@ class EngineTest(unittest.TestCase):
         backends.Session = lambda: self.os
         FakeTracker.face, FakeTracker.opens, FakeTracker.closes, FakeTracker.args = None, 0, 0, None
         FakeTracker.fail_open = FakeTracker.no_frames = False
+        FakeTracker.rate = None
         FakeTracker.shapes_on = FakeTracker.shapes = None
         FakeWatcher.instance = FakeVCam.instance = None
         self.engines = []
@@ -493,6 +499,16 @@ class EngineTest(unittest.TestCase):
         self.assertFalse(e.resolution_mismatch)
         self.assertTrue(e.window_mode)
 
+    def test_a_calibration_saved_before_the_height_was_recorded_counts_as_720p(self):
+        model = identity_model()
+        with open(engine_mod.CALIB_PATH, "w") as f:
+            json.dump({"monitors": [list(m) for m in MONITORS], "yaw": [-20.0, 20.0], "gaze": model.to_dict()}, f)
+        e = engine_mod.Engine({**engine_mod.DEFAULTS, "mode": "window"})          # the fake camera gives 1080p
+        self.engines.append(e)
+        self.assertEqual(e.calib_height, 720)
+        self.assertTrue(self.wait_for(lambda: e.resolution_mismatch))
+        self.assertFalse(e.window_mode)
+
     def test_the_calibration_remembers_its_resolution_across_restarts(self):
         e = self.start("window")
         e.set_calibration([-20.0, 20.0], MONITORS, identity_model(), 1080)
@@ -501,6 +517,59 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(again.calib_height, 1080)
         again.active_height = 720                                       # the camera now gives something else
         self.assertTrue(again.resolution_mismatch)
+
+    # --- adaptive tracking rate --------------------------------------------
+    def calm_quickly(self):
+        self.addCleanup(setattr, engine_mod, "CALM_S", engine_mod.CALM_S)
+        engine_mod.CALM_S = 0.4
+
+    def test_slows_down_when_nothing_happens_and_speeds_up_when_the_head_moves(self):
+        self.calm_quickly()
+        self.start("monitor")
+        FakeTracker.face = looking_at(500, 500, yaw=0.0)
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == engine_mod.IDLE_FPS, 3))
+        FakeTracker.face = looking_at(500, 500, yaw=15.0)                    # the head moves
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == 30, 1))
+        FakeTracker.face = looking_at(500, 500, yaw=15.0)
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == engine_mod.IDLE_FPS, 3))   # calm again
+
+    def test_the_gaze_leaving_its_fixation_wakes_the_tracker_in_window_mode(self):
+        self.calm_quickly()
+        self.start("window")
+        FakeTracker.face = looking_at(500, 500)
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == engine_mod.IDLE_FPS, 3))
+        FakeTracker.face = looking_at(1400, 500)                              # looking elsewhere
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == 30, 1))
+
+    def test_adaptive_rate_can_be_switched_off(self):
+        self.calm_quickly()
+        self.start("monitor", adaptive_rate=False)
+        FakeTracker.face = looking_at(500, 500)
+        time.sleep(1.2)                                                       # three times CALM_S
+        self.assertEqual(FakeTracker.rate, 30)
+
+    def test_calibration_and_the_camera_view_keep_full_speed(self):
+        self.calm_quickly()
+        e = self.start("monitor")
+        FakeTracker.face = looking_at(500, 500)
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == engine_mod.IDLE_FPS, 3))
+        e.calibrating = True
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == 30, 1))
+        e.calibrating = False
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == engine_mod.IDLE_FPS, 3))
+        e.preview_wanted = 1
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == 30, 1))
+        time.sleep(0.8)
+        self.assertEqual(FakeTracker.rate, 30)
+
+    def test_a_gesture_starting_wakes_the_tracker_before_it_triggers(self):
+        self.calm_quickly()
+        self.gestures("monitor", binding(hold_ms=2000))                      # never reaches its hold
+        FakeTracker.face = looking_at(500, 500)
+        FakeTracker.shapes = {"browInnerUp": 0.0}
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == engine_mod.IDLE_FPS, 3))
+        FakeTracker.shapes = {"browInnerUp": 0.3}                             # starting, above 0.2 of the score
+        self.assertTrue(self.wait_for(lambda: FakeTracker.rate == 30, 1))
 
     # --- debug view --------------------------------------------------------
     def test_preview_is_rendered_only_while_someone_watches(self):

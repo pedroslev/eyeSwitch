@@ -36,6 +36,7 @@ DEFAULTS = {
                                 # only fits the resolution it was made at
     "tracking_fps": 30,         # 30 or 15: tracking rate (the camera must deliver it); 30 reacts sooner and
                                 # averages twice the samples, for about 60% more CPU than 15
+    "adaptive_rate": True,      # slow tracking down to IDLE_FPS when nothing is happening (saves ~2/3 of the CPU)
     "stability": 3,             # window mode, 1..5: how steady the gaze point is (higher = steadier, slower)
     "edge_px": 0,               # window mode: stay on the active window within this many px of it (0 = auto)
     "gestures": {               # facial gestures that press keys; bindings come from the Gestures dialog
@@ -53,6 +54,10 @@ EDGE_MARGIN = 0.04      # gaze must be this far (monitor widths) inside a monito
 WINDOW_POLL = 0.1       # seconds between "which window is under the gaze" lookups
 RETRY = 4.0             # seconds of calm before taking the camera back from another app
 RANGE_LIMIT = 0.5       # pose this far outside the calibrated range (fraction of it): do not act on it
+IDLE_FPS = 10           # tracking rate while nothing is happening
+CALM_S = 1.5            # seconds without any sign of movement before slowing down
+ACTIVITY_YAW_DEG = 1.5  # the head moved this much off its smoothed yaw: something is happening
+ACTIVITY_SHARE = 0.35   # the estimate is this share of the fixation radius off the held point: so is this
 
 # Candidate feature sets for the gaze model; the one that cross-validates best wins. Head position
 # (tx, ty, tz) is deliberately absent: it says where you sit, not where you look, and a model fitted
@@ -131,6 +136,11 @@ def stay_on_active(wid, active, bounds, point, margin):
         if x - margin <= point[0] < x + w + margin and y - margin <= point[1] < y + h + margin:
             return active
     return wid
+
+
+def window_mode_cfg(engine):
+    """Window mode is selected (whether or not its model is ready): the test dot needs full speed."""
+    return engine.cfg["mode"] == "window"
 
 
 def switch(xs, monitors, idx, last_window, last_pointer, wid=None):
@@ -281,7 +291,8 @@ class Engine:
         self.centers, self.calib_monitors, self.gaze_model = None, None, None
         self.calib_height = None        # camera height the gaze model was calibrated at (None: unknown)
         self.active_height = None       # camera height in use right now (None: camera not opened yet)
-        self.fps = 15.0                 # tracking rate measured while running (the filters are tuned in seconds)
+        self.fps = 15.0                 # tracking rate measured while running
+        self.tracking_rate = None       # what the engine asked of the tracker last: full speed or IDLE_FPS
         self._capture = self._shape_capture = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -295,7 +306,8 @@ class Engine:
             with open(CALIB_PATH) as f:
                 data = json.load(f)
             self.centers, self.calib_monitors = data["yaw"], data["monitors"]
-            self.calib_height = data.get("camera_height")
+            # Calibrations saved before the height was recorded were made in window mode, which ran at 720p.
+            self.calib_height = data.get("camera_height", 720)
             if data.get("gaze"):
                 model = GazeModel.from_dict(data["gaze"])
                 if len(model.mean) == len(Face._fields):
@@ -362,7 +374,7 @@ class Engine:
         return samples
 
     def _render_preview(self, tracker, face, frame):
-        lines = [self.status, f"{frame.shape[1]}x{frame.shape[0]}  {self.fps:.0f} fps"]
+        lines = [self.status, f"{frame.shape[1]}x{frame.shape[0]}  tracking at {self.tracking_rate or 0:.0f} fps"]
         if face is not None:
             lines += [f"yaw {face.yaw:+6.1f}   pitch {face.pitch:+6.1f}",
                       f"iris h {face.h:+.3f}   v {face.v:+.3f}   nose {face.nx:+.2f} {face.ny:+.2f}",
@@ -434,6 +446,7 @@ class Engine:
         gaze_filter, filter_key, live_filter = FixationFilter(), None, OneEuro()
         win_checked, win_under, active_bounds = 0.0, None, None
         blink_detector, blink_until, last_frame_t = BlinkDetector(), 0.0, None
+        active_until = time.monotonic() + CALM_S                   # adaptive rate: full speed until then
         suppress_until, gesture_state = 0.0, (-1, [])      # (version, [(binding, model, detector)])
 
         while not self._stop.is_set():
@@ -451,6 +464,14 @@ class Engine:
 
             if not camera.ensure():
                 continue
+            top = time.monotonic()
+            if cand is not None:
+                active_until = max(active_until, top + CALM_S)          # a decision is pending: stay sharp
+            force = (self.calibrating or self.preview_wanted > 0 or self.want_shapes
+                     or (window_mode_cfg(self) and self.cfg["show_gaze"]))
+            full = (not self.cfg.get("adaptive_rate", True)) or force or top < active_until
+            self.tracking_rate = camera.tracker.max_fps if full else IDLE_FPS
+            camera.tracker.set_rate(self.tracking_rate)
             try:
                 face, frame = camera.tracker.read()
             except Exception as e:                # show it instead of silently killing the thread
@@ -514,6 +535,8 @@ class Engine:
                     self._shape_capture.append(dict(camera.tracker.shapes))
             smooth = face.yaw if smooth is None else smooth + SMOOTH * (face.yaw - smooth)
             self.yaw = smooth
+            if abs(face.yaw - smooth) > ACTIVITY_YAW_DEG:       # (a blink says nothing about where you look)
+                active_until = now + CALM_S
 
             # Where on the desktop are you looking (window mode, or to click where you look).
             calibrated = self.calibrated
@@ -522,7 +545,8 @@ class Engine:
             if calibrated and self.gaze_model is not None and (window_mode or click_wanted):
                 model, vec = self.gaze_model, np.asarray(face, float)
                 level = min(max(int(self.cfg.get("stability", 3)), 1), 5)
-                rate = max(5, round(self.fps / 5) * 5)                 # frames per second, in steps of 5
+                design = min(camera.tracker.max_fps, camera.tracker.camera_fps)      # what full speed delivers
+                rate = max(5, round(design / 5) * 5)                  # frames per second, in steps of 5
                 if filter_key != (id(model), level, rate):            # new model, setting or rate: new filter
                     seconds, factor = STABILITY[level]
                     radius = min(max(2.2 * (model.noise_px or 90.0) * factor, 100.0), 320.0)
@@ -537,6 +561,8 @@ class Engine:
                 else:
                     raw = model.predict(vec)
                     g, live = gaze_filter.update(raw), live_filter.update(raw, now)
+                    if gaze_filter.pending or math.hypot(raw[0] - g[0], raw[1] - g[1]) > ACTIVITY_SHARE * gaze_filter.radius:
+                        active_until = now + CALM_S
                     self.gaze = clamp_to_monitors(g[0], g[1], monitors)
                     self.gaze_live = clamp_to_monitors(live[0], live[1], monitors)
             else:
@@ -550,6 +576,8 @@ class Engine:
                 score = model.score(shapes) if shapes else None
                 if score is not None:
                     self.gesture_scores[b["label"]] = score
+                    if score > 0.2:
+                        active_until = now + CALM_S                     # a gesture is starting: do not miss its hold
                 if det.update(score, now) and not self.calibrating:
                     suppress_until = max(suppress_until, now + self._fire(xs, b))
                     px, py = xs.pointer()                         # our own warp is not mouse activity

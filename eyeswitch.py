@@ -556,6 +556,12 @@ class MainWindow(QWidget):
                              "for the same wait, for about 60% more CPU (around 11% of a 12-core machine). "
                              "If the camera cannot deliver 30, it simply runs at what it gives.")
         self.rate.currentIndexChanged.connect(lambda _: self._set("tracking_fps", self.rate.currentData()))
+        self.adaptive = QCheckBox("Slow down when nothing is happening (saves CPU)")
+        self.adaptive.setChecked(cfg["adaptive_rate"])
+        self.adaptive.setToolTip("Tracks at full speed while you move your head, your eyes, blink or make a "
+                                 "gesture, and at 10 per second after 1.5 s of calm, which takes about two "
+                                 "thirds off the CPU. Untick it for the fastest possible first reaction.")
+        self.adaptive.toggled.connect(lambda on: self._set("adaptive_rate", on))
         self.stability = self._spin(QSpinBox(), 1, 5, 1, "", cfg["stability"], "stability")
         self.stability.setToolTip("How steady the gaze point is: higher holds it still more firmly and "
                                   "follows you a little later. Raise it if focus jumps around.")
@@ -613,6 +619,7 @@ class MainWindow(QWidget):
         for w in (self.status, self.detail, self.enabled):
             layout.addWidget(w)
         layout.addLayout(self.form)
+        layout.addWidget(self.adaptive)
         layout.addWidget(self.show_gaze)
         layout.addWidget(self.vcam)
         layout.addWidget(self.vcam_note)

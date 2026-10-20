@@ -132,6 +132,7 @@ Settings: camera, mode, delay before switching monitor (default 300 ms), delay b
 window (500 ms), steadiness 1-5 (how firmly the gaze point is held still; higher is steadier and a little slower),
 camera resolution (Auto by default: the best the camera really delivers, up to 1080p; or 1080p / 720p.
 A gaze calibration only fits the resolution it was made at, and eyeSwitch says so if they differ),
+tracking rate (30 per second by default, or 15) and whether to slow down when nothing is happening,
 window edge tolerance (keeps the focus on the active window while your gaze is within
 this distance of it, `auto` follows the gaze error; raise it if focus flickers between two windows), wait after typing (2 s: window mode never changes focus inside a monitor while you
 are typing), start at login. Ctrl+Shift+G pauses and resumes; while paused the camera is released.
@@ -211,6 +212,44 @@ cannot use it. What eyeSwitch does about it:
 - `eyeswitch.py`: Qt app (settings window, calibration, tray). `autostart.py`: start at login.
 
 Everything runs locally; frames are never stored.
+
+## CPU use
+
+Measured with a 1080p webcam on a 12-core Linux desktop, the whole engine (camera, tracking, filters)
+with a stand-in desktop so nothing was touched:
+
+| Configuration | CPU |
+|---------------|-----|
+| 30 fps, OpenCV on all 12 threads (the naive setup) | 131% of one core |
+| 30 fps always, OpenCV on one thread | 70% |
+| **30 fps adaptive (default)** | **28%**, in the idle rate 90% of the time |
+| 15 fps always | 36% |
+
+Where it went, and what was done:
+
+- **OpenCV used every core for trivial work.** A BGR to RGB conversion takes 0.2 ms either way, but cost
+  13 times more CPU on 12 threads. `cv2.setNumThreads(1)` took the whole pipeline from 43.5 to 23 ms of
+  CPU per 1080p frame, with identical results.
+- **Frames nobody needs are not even decoded.** At rest the tracker drops to 10 fps (`grab` without
+  `retrieve`, so the JPEG decode is skipped) and returns to full speed at the first sign of movement:
+  the head moves, the gaze leaves its fixation, a decision or a gesture is pending, a calibration or the
+  camera view is open, or the test dot is shown. Blinks do not count: they say nothing about where you
+  look. Turn **Slow down when nothing is happening** off for the fastest possible first reaction (the
+  worst case when starting from rest is one idle frame, 100 ms).
+- **The rest is already cheap**: the system calls around each frame cost 0.23 ms (0.7% of a core at
+  30 fps), and the window is up 0.3 s after launch (MediaPipe is imported in the engine thread, not
+  before the window), idling at 0.2% of a core.
+- **Rewriting in another language would not help**: what is left is decoding the camera's JPEG and
+  MediaPipe's models, both native code already. Python's own share is a few percent.
+- Tried and discarded: MediaPipe's GPU delegate (not available in this Linux build), and cropping the image
+  to the face (saves the same preparation cost, but MediaPipe estimates the head pose assuming the whole
+  image, so a moving crop would bias yaw and pitch).
+
+**The camera's resolution changes what it measures.** With the head at rest, the same face gave different
+numbers at 720p and 1080p (yaw 4.4 degrees, pitch 9.2 degrees, vertical iris 0.059; webcams often use a
+different field of view per mode and MediaPipe assumes one). That is why a gaze calibration is stored
+with the resolution it was made at, and why a calibration made at another one is reported instead of
+used.
 
 ## Tests
 

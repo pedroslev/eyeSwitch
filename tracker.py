@@ -7,12 +7,13 @@ import urllib.request
 from collections import namedtuple
 
 import cv2
-import mediapipe as mp
 import numpy as np
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision
 
 from virtualcam import LABEL as VIRTUAL_LABEL
+
+# OpenCV spreads even a colour conversion over every core: the same 0.2 ms of wall time cost 13x more CPU
+# with 12 threads than with one (2.6 vs 0.2 ms), and the whole pipeline 43.5 vs 23 ms per 1080p frame.
+cv2.setNumThreads(1)
 
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
              "face_landmarker/float16/1/face_landmarker.task")
@@ -83,6 +84,10 @@ class HeadTracker:
         when asked and possible. Tracking runs at `fps` (15 or 30). `sink(frame)` receives every camera
         frame (for the virtual camera, at 30 fps so calls look good)."""
         ensure_model()
+        import mediapipe as mp                       # imported here, in the engine thread, so the window
+        from mediapipe.tasks import python as mp_python      # appears at once instead of after ~1 s of imports
+        from mediapipe.tasks.python import vision
+        self._mp = mp
         self.sink = sink
         self.cap = cv2.VideoCapture(camera, _capture_api())
         if not self.cap.isOpened():
@@ -101,7 +106,9 @@ class HeadTracker:
         self.landmarks = self.matrix = self.frame_wh = None
         self.blink = None            # mean eyelid closure score 0..1 (needs blendshapes)
         self.landmarker = vision.FaceLandmarker.create_from_options(opts)
+        self.max_fps = self.fps = fps
         self.min_interval = 0.8 / fps                # 0.8: do not skip frames to timing jitter
+        self.camera_fps, self._grabbed = 30.0, None     # what the camera really delivers, measured
         self._last = 0.0
         self._t0 = time.monotonic()
 
@@ -119,18 +126,33 @@ class HeadTracker:
                     break
         return got
 
+    def set_rate(self, fps):
+        """Track at `fps` (never above the rate this tracker was opened with). The camera keeps delivering
+        frames; the ones in between are grabbed but not even decoded, which is where the CPU goes."""
+        self.fps = min(max(fps, 1), self.max_fps)
+        self.min_interval = 0.8 / self.fps
+
     def read(self):
         """Return (Face or None, frame) at the tracking rate. Extra frames go to the sink."""
         while True:
-            ok, frame = self.cap.read()
+            if not self.cap.grab():
+                return None, None
+            now = time.monotonic()
+            if self._grabbed is not None and now > self._grabbed:
+                self.camera_fps += 0.05 * (1.0 / (now - self._grabbed) - self.camera_fps)
+            self._grabbed = now
+            due = now - self._last >= self.min_interval
+            if self.sink is None and not due:
+                continue                                    # not needed: skip the JPEG decode altogether
+            ok, frame = self.cap.retrieve()
             if not ok:
                 return None, None
             if self.sink is not None:
                 self.sink(frame)
-            now = time.monotonic()
-            if now - self._last >= self.min_interval:
+            if due:
                 break
         self._last = now
+        mp = self._mp
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         res = self.landmarker.detect_for_video(img, int((now - self._t0) * 1000))
