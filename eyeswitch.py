@@ -455,6 +455,248 @@ class GazeDot(QWidget):
             self.show()
 
 
+ACTIONS = [("Press keys", "keys"), ("Click where I look", "click"), ("Pause / resume eyeSwitch", "toggle")]
+
+
+class TrainDialog(QDialog):
+    """Records a relaxed face, then the gesture, and trains the model from the two."""
+    REACT_MS, RELAXED_MS, GESTURE_MS = 1500, 2000, 2500       # time to get ready, then to record each
+
+    def __init__(self, parent, engine, on_done):
+        super().__init__(parent)
+        self.setWindowTitle("Train gesture")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self.engine, self.on_done, self.finished_ = engine, on_done, False
+        self.relaxed = None
+        self.text = QLabel("Getting the camera ready...")
+        f = self.text.font()
+        f.setPointSize(f.pointSize() + 3)
+        f.setBold(True)
+        self.text.setFont(f)
+        self.text.setAlignment(Qt.AlignCenter)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.addWidget(self.text)
+        layout.addWidget(cancel)
+        engine.want_shapes = engine.calibrating = True       # camera on, blendshapes on, no auto focus
+        self.t0 = time.monotonic()
+        self.poll = QTimer(self)
+        self.poll.timeout.connect(self._ready)
+        self.poll.start(100)
+
+    def _ready(self):
+        if time.monotonic() - self.engine.shapes_seen < 0.5:
+            self.poll.stop()
+            self._say("Relax your face and look at the screen", self.REACT_MS, self._start_relaxed)
+        elif time.monotonic() - self.t0 > 12:
+            self._finish(None, "No face data came from the camera. Is another app using it?")
+
+    def _say(self, text, delay_ms, then):
+        self.text.setText(text)
+        QTimer.singleShot(delay_ms, lambda: not self.finished_ and then())
+
+    def _start_relaxed(self):
+        self.engine.begin_shape_capture()
+        self.text.setText("Hold still... (relaxed)")
+        QTimer.singleShot(self.RELAXED_MS, lambda: not self.finished_ and self._end_relaxed())
+
+    def _end_relaxed(self):
+        self.relaxed = self.engine.end_shape_capture()
+        if len(self.relaxed) < 15:
+            return self._finish(None, "Your face was not detected. Face the camera and try again.")
+        self._say("Now make the gesture and HOLD it", self.REACT_MS, self._start_gesture)
+
+    def _start_gesture(self):
+        self.engine.begin_shape_capture()
+        self.text.setText("Keep holding it...")
+        QTimer.singleShot(self.GESTURE_MS, lambda: not self.finished_ and self._end_gesture())
+
+    def _end_gesture(self):
+        shown = self.engine.end_shape_capture()
+        if len(shown) < 15:
+            return self._finish(None, "Your face was not detected. Face the camera and try again.")
+        self._finish(gestures.train(self.relaxed, shown), "")
+
+    def _finish(self, model, message):
+        if self.finished_:
+            return
+        self.finished_ = True
+        self.engine.want_shapes = self.engine.calibrating = False
+        self.accept()
+        self.on_done(model, message)
+
+    def reject(self):
+        if not self.finished_:
+            self.finished_ = True
+            self.engine.want_shapes = self.engine.calibrating = False
+        super().reject()
+
+
+class GestureRow(QWidget):
+    def __init__(self, dialog, binding):
+        super().__init__()
+        self.dialog, self.binding = dialog, binding
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.name = QLineEdit(binding["label"])
+        self.name.setFixedWidth(120)
+        self.action = QComboBox()
+        for label, value in ACTIONS:
+            self.action.addItem(label, value)
+        self.action.setCurrentIndex(max(self.action.findData(binding.get("action", "keys")), 0))
+        self.action.setMinimumWidth(200)
+        self.keys = QLineEdit(binding.get("keys", ""))
+        self.keys.setPlaceholderText("super, alt+tab, ctrl+shift+g")
+        self.keys.setFixedWidth(170)
+        self.hold = QSpinBox()
+        self.hold.setRange(100, 1500)
+        self.hold.setSingleStep(50)
+        self.hold.setSuffix(" ms")
+        self.hold.setValue(binding.get("hold_ms", 250))
+        self.hold.setToolTip("How long the gesture must be held")
+        self.hold.setFixedWidth(95)
+        self.train_btn = QPushButton("Train")
+        self.status = QLabel()
+        self.status.setFixedWidth(150)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 150)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedWidth(70)
+        self.bar.setToolTip("Live: fills past two thirds when the gesture is detected")
+        remove = QPushButton("\u2715")
+        remove.setFixedWidth(30)
+        for w in (self.name, self.action, self.keys, self.hold, self.train_btn, self.status, self.bar, remove):
+            row.addWidget(w)
+        self.name.editingFinished.connect(self._changed)
+        self.action.currentIndexChanged.connect(self._changed)
+        self.keys.editingFinished.connect(self._changed)
+        self.hold.valueChanged.connect(self._changed)
+        self.train_btn.clicked.connect(lambda: dialog.train(self))
+        remove.clicked.connect(lambda: dialog.remove(self))
+        self._changed()
+        self.show_status()
+
+    def _changed(self, *_):
+        b = self.binding
+        b["label"], b["action"] = self.name.text().strip() or "Gesture", self.action.currentData()
+        b["keys"], b["hold_ms"] = self.keys.text().strip(), self.hold.value()
+        self.keys.setEnabled(b["action"] == "keys")
+        self.dialog.engine.gestures_changed()
+
+    def show_status(self):
+        model = self.binding.get("model")
+        if not model:
+            self.status.setText("not trained")
+        else:
+            m = gestures.GestureModel.from_dict(model)
+            self.status.setText(("reliable" if m.reliable else "weak: retrain") + f" ({m.quality:.1f})")
+            self.status.setToolTip("Uses: " + ", ".join(m.names))
+
+
+class GesturesDialog(QDialog):
+    def __init__(self, parent, engine, cfg):
+        super().__init__(parent)
+        self.engine, self.g = engine, cfg["gestures"]
+        self.setWindowTitle("Gestures")
+        self.setMinimumWidth(920)
+        self.enabled = QCheckBox("Enable gestures")
+        self.enabled.setChecked(self.g["enabled"])
+        self.enabled.toggled.connect(self._enabled)
+        self.pause = QSpinBox()
+        self.pause.setRange(0, 30)
+        self.pause.setSuffix(" s")
+        self.pause.setValue(int(self.g.get("pause_s", 6)))
+        self.pause.valueChanged.connect(self._pause)
+        form = QFormLayout()
+        form.addRow("After a key gesture, don't switch focus automatically for", self.pause)
+        self.rows_box = QVBoxLayout()
+        add = QPushButton("Add gesture")
+        add.clicked.connect(self.add)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        self.log = QLabel()
+        self.log.setEnabled(False)
+        hint = QLabel("Train each gesture with your own face: relax, then do it and hold it. Eyebrows up "
+                      "works well; subtler ones (biting a lip) may come out as \u201cweak\u201d. "
+                      "Tip: raise your eyebrows for the Windows/Super key, then look at an app and use "
+                      "\u201cClick where I look\u201d on another gesture to pick it.")
+        hint.setWordWrap(True)
+        hint.setEnabled(False)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.addWidget(self.enabled)
+        layout.addLayout(form)
+        layout.addLayout(self.rows_box)
+        buttons = QHBoxLayout()
+        buttons.addWidget(add)
+        buttons.addStretch()
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        layout.addWidget(self.log)
+        layout.addWidget(hint)
+        self.rows = []
+        for b in self.g["bindings"]:
+            self._add_row(b)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._live)
+        self.timer.start(100)
+
+    def _add_row(self, binding):
+        row = GestureRow(self, binding)
+        self.rows.append(row)
+        self.rows_box.addWidget(row)
+
+    def add(self):
+        names = {b["label"] for b in self.g["bindings"]}
+        n = 1
+        while f"Gesture {n}" in names:
+            n += 1
+        b = {"label": f"Gesture {n}", "action": "keys", "keys": "super", "hold_ms": 250, "model": None}
+        self.g["bindings"].append(b)
+        self._add_row(b)
+        self.engine.gestures_changed()
+
+    def remove(self, row):
+        self.g["bindings"].remove(row.binding)
+        self.rows.remove(row)
+        row.setParent(None)
+        row.deleteLater()
+        self.engine.gestures_changed()
+        self.adjustSize()
+
+    def train(self, row):
+        TrainDialog(self, self.engine, lambda model, msg: self._trained(row, model, msg)).exec()
+
+    def _trained(self, row, model, message):
+        if model is None:
+            return QMessageBox.warning(self, "eyeSwitch", message)
+        row.binding["model"] = model.to_dict()
+        row.show_status()
+        self.engine.gestures_changed()
+        if not model.reliable:
+            QMessageBox.warning(self, "eyeSwitch", "This gesture looks too much like your relaxed face "
+                                "(separation %.1f). Try a bigger or more distinct movement and train it "
+                                "again; otherwise it will trigger by accident or not at all." % model.quality)
+
+    def _enabled(self, on):
+        self.g["enabled"] = on
+        self.engine.gestures_changed()
+
+    def _pause(self, value):
+        self.g["pause_s"] = value
+        self.engine.gestures_changed()
+
+    def _live(self):
+        for row in self.rows:
+            score = self.engine.gesture_scores.get(row.binding["label"])
+            live = self.g["enabled"] and row.binding.get("model") and score is not None
+            row.bar.setValue(int(max(0, min(150, score * 100))) if live else 0)
+        self.log.setText(self.engine.gesture_log)
+
+
 class PreviewWindow(QWidget):
     """Live camera view with the face mesh, irises and the numbers the model gets."""
 
