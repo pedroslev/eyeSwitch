@@ -181,6 +181,7 @@ class MainWindow(Gtk.ApplicationWindow):
             box.pack_start(hint, False, False, 0)
 
         self.connect("delete-event", self._on_close)
+        box.show_all()                  # present() alone shows an empty window
         self.sync()
         GLib.timeout_add(300, self._refresh)
 
