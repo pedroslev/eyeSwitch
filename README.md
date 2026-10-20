@@ -13,12 +13,21 @@ Runs as a desktop app with a tray icon and a small settings window (Qt).
 
 ## Install
 
-Python 3.10+ is required.
+Python 3.10+ is required. Use a virtual environment (recent Ubuntu/Debian refuse a plain
+`pip install` with "externally-managed-environment").
 
 ```bash
+git clone git@github.com:pedroslev/eyeSwitch.git
+cd eyeSwitch
+
+python3 -m venv .venv               # Windows: py -m venv .venv
+source .venv/bin/activate           # Windows: .venv\Scripts\activate
 pip install -r requirements.txt     # the face model downloads itself on first run
 python install.py                   # adds "eyeSwitch" to your application menu
 ```
+
+The menu entry remembers this venv, so you never need to activate it again.
+Do the per-OS step below **before** the first launch.
 
 Per OS:
 
