@@ -191,9 +191,7 @@ class HeadTracker:
         self.blink = None            # mean eyelid closure score 0..1 (needs blendshapes)
         self.landmarker = vision.FaceLandmarker.create_from_options(opts)
         self.face_enabled, self.hand, self.recognizer, self._last_hand, self._hand_seen = True, None, None, 0.0, -1e9
-        if hands:
-            ensure_model(HAND_MODEL_PATH, HAND_MODEL_URL)
-            self.recognizer = HandProcess(HAND_MODEL_PATH)
+        self.set_hands(hands)
         self.max_fps = self.fps = fps
         self.min_interval = 0.8 / fps                # 0.8: do not skip frames to timing jitter
         self.camera_fps, self._grabbed = 30.0, None     # what the camera really delivers, measured
@@ -213,6 +211,15 @@ class HeadTracker:
                 if got == (w, h):
                     break
         return got
+
+    def set_hands(self, on):
+        """Start or stop watching for a hand without touching the camera or the face model."""
+        if on and self.recognizer is None:
+            ensure_model(HAND_MODEL_PATH, HAND_MODEL_URL)
+            self.recognizer = HandProcess(HAND_MODEL_PATH)
+        elif not on and self.recognizer is not None:
+            self.recognizer.close()
+            self.recognizer, self.hand = None, None
 
     def set_face_enabled(self, on):
         """Skip the face model altogether (the engine is suspended and only watches for the hand)."""

@@ -121,6 +121,9 @@ class FakeTracker:
     def set_rate(self, fps):
         FakeTracker.rate = fps
 
+    def set_hands(self, on):
+        FakeTracker.hands_on, self.recognizer = on, (object() if on else None)
+
     def set_face_enabled(self, on):
         FakeTracker.face_enabled = on
 
@@ -309,6 +312,14 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: e.gaze is not None and e.gaze == (0, 1079)))
 
     # --- suspend / resume: the flag is off, the program keeps watching ------
+    def test_turning_the_hand_on_does_not_reopen_the_camera(self):
+        e = self.start("window")
+        opens = FakeTracker.opens
+        e.cfg["gestures"] = {"enabled": False, "pause_s": 1.0, "bindings": [], "hand_toggle": True}
+        e.gestures_changed()
+        self.assertTrue(self.wait_for(lambda: FakeTracker.hands_on))
+        self.assertEqual(FakeTracker.opens, opens)
+
     def with_hand(self, mode="window", *bindings):
         e = self.start(mode)
         e.cfg["gestures"] = {"enabled": bool(bindings), "pause_s": 1.0, "bindings": list(bindings), "hand_toggle": True}

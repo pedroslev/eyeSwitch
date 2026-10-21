@@ -224,7 +224,11 @@ class Camera:
         """Open the camera unless we are stepping aside. True when frames can be read."""
         e, now, key = self.engine, time.monotonic(), self._wanted()
         if self.tracker and self.key != key:              # settings changed
-            self._close()
+            if self.key[:5] == key[:5] and hasattr(self.tracker, "set_hands"):
+                self.tracker.set_hands(key[5])            # only the hand: no need to reopen the camera or the face model
+                self.key = key
+            else:
+                self._close()
         self._watch(key[0])
         if self.watcher and self.watcher.foreign_open.is_set():
             self.watcher.foreign_open.clear()
