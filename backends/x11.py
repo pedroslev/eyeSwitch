@@ -1,4 +1,7 @@
 """X11 backend: RandR monitors, EWMH window focus, pointer warp, XGrabKey hotkey."""
+import atexit
+import re
+import subprocess
 import threading
 import time
 
@@ -111,6 +114,37 @@ class Session(BaseSession):
         return self._bounds(wid)
 
     MAX_TAP_S = 2.0
+    _SHELL = ["--session", "--dest", "org.gnome.Shell", "--object-path", "/org/gnome/Shell"]
+
+    def overview_open(self):
+        """GNOME Shell's overview, from its OverviewActive property (it announces changes, so this costs
+        nothing per call). None where there is no GNOME Shell to ask."""
+        if not hasattr(self, "_overview"):
+            self._overview = None
+            threading.Thread(target=self._watch_overview, daemon=True).start()
+        return self._overview
+
+    def _watch_overview(self):
+        proc = None
+        try:
+            proc = subprocess.Popen(["gdbus", "monitor", *self._SHELL], stdout=subprocess.PIPE, text=True,
+                                    stderr=subprocess.DEVNULL)
+            atexit.register(proc.kill)
+            got = subprocess.run(["gdbus", "call", *self._SHELL, "--method", "org.freedesktop.DBus.Properties.Get",
+                                  "org.gnome.Shell", "OverviewActive"], capture_output=True, text=True, timeout=3)
+            if got.returncode != 0:
+                return                                              # no GNOME Shell: stay unknown
+            self._overview = "true" in got.stdout
+            for line in proc.stdout:
+                found = re.search(r"'OverviewActive': <(true|false)>", line)
+                if found:
+                    self._overview = found.group(1) == "true"
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            self._overview = None                                    # the shell went away or never answered
+            if proc is not None:
+                proc.kill()
 
     def super_tapped(self):
         """Taps of the Super key on the real keyboard, seen through the RECORD extension (it only observes:

@@ -62,7 +62,8 @@ IDLE_FPS = 10           # tracking rate while nothing is happening
 SUSPENDED_FPS = 3       # while suspended and no hand is around: just often enough to notice one
 CALM_S = 1.5            # seconds without any sign of movement before slowing down
 ACTIVITY_YAW_DEG = 1.5  # the head moved this much off its smoothed yaw: something is happening
-SESSION_GRACE = 0.6     # seconds after Super before a dwell can click (the overview animates in)
+SESSION_GRACE = 0.6     # seconds after the overview opens before a dwell can click (it animates in)
+OVERVIEW_MAX_S = 30.0   # a session that began with the overview itself lasts as long as it stays open, up to this
 DWELL_RADIUS = 90       # px: the gaze counts as "one spot" while it stays this close to where the dwell began
 SESSION_MOUSE_PX = 12   # you moved the mouse yourself this much: the session is over, it is yours
 
@@ -311,6 +312,7 @@ class Engine:
         self.tracking_rate = None       # what the engine asked of the tracker last: full speed or IDLE_FPS
         self.session_start = self.session_until = 0.0    # "overview session": pointer follows the gaze until then
         self.in_session = False
+        self.overview, self._overview_was_open = None, False   # the system's all-apps view: True / False / None (unknown)
         self.suspended = False          # flag off but still watching: only a toggle gesture / the hand can undo it
         self.hand_text = ""             # what the hand recognizer sees right now, for the Gestures screen
         self._capture = self._shape_capture = None
@@ -574,6 +576,18 @@ class Engine:
             moved = abs(nx - px) + abs(ny - py)
             if moved > SESSION_MOUSE_PX and now - self.session_start > 0.3:
                 self._end_session()                                   # you took the mouse: it is yours again
+            # The all-apps view (GNOME's overview) is what this is for: opening it, however it was opened,
+            # starts a session; the pointer and the click only act while it is open, and closing it ends it.
+            ov = xs.overview_open()
+            self.overview = ov
+            if ov and not self._overview_was_open and not self.suspended and not self.calibrating:
+                if self.cfg["gestures"].get("gaze_cursor", True) and self._start_session(OVERVIEW_MAX_S):
+                    self.gesture_log = "Overview: the pointer follows your gaze, look at an app"
+            if ov is False and self._overview_was_open:
+                self._end_session()
+            self._overview_was_open = bool(ov)
+            if ov:
+                suppress_until = max(suppress_until, now + 0.5)     # no automatic focus changes behind the overview
             session = self.in_session = now < self.session_until
             if moved > 2:
                 mouse_time = now
@@ -705,8 +719,8 @@ class Engine:
                 tracker.hand_urgent = starting
 
             # Super on the keyboard opens the overview by itself: the pointer follows the gaze from there too.
-            if (xs.super_tapped() and self.cfg["gestures"].get("keyboard_super", True) and not self.suspended
-                    and not self.calibrating):
+            if (ov is None and xs.super_tapped() and self.cfg["gestures"].get("keyboard_super", True)
+                    and not self.suspended and not self.calibrating):       # (when the overview can be seen it starts it)
                 seconds = float(self.cfg["gestures"].get("pause_s", 6.0))
                 if self._start_session(seconds):
                     suppress_until = max(suppress_until, now + seconds)
@@ -716,10 +730,11 @@ class Engine:
 
             # Overview session: the pointer follows the gaze; one spot held long enough is a click.
             dwell_ms = int(self.cfg["gestures"].get("dwell_ms", 1200))
-            if session and self.gaze_live is not None and not self.calibrating:
+            if session and ov is not False and self.gaze_live is not None and not self.calibrating:
                 xs.warp(int(self.gaze_live[0]), int(self.gaze_live[1]))
                 px, py = xs.pointer()
-                if dwell_ms > 0 and self.gaze is not None and now - self.session_start > SESSION_GRACE:
+                # A click by looking needs proof that the overview is open: anywhere else, looking is not clicking.
+                if ov is True and dwell_ms > 0 and self.gaze is not None and now - self.session_start > SESSION_GRACE:
                     if dwell_anchor is None or math.hypot(self.gaze[0] - dwell_anchor[0],
                                                           self.gaze[1] - dwell_anchor[1]) > DWELL_RADIUS:
                         dwell_anchor, dwell_since = self.gaze, now

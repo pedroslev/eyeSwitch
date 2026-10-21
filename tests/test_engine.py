@@ -28,6 +28,7 @@ class FakeSession(BaseSession):
     def __init__(self):
         self.active, self.activated, self.warps, self.key_age = A, [], [], 99.0
         self.pressed, self.clicks, self.ptr, self.super_taps = [], 0, (100, 100), 0
+        self.overview = None                                  # the all-apps view: True / False / None (cannot tell)
 
     def monitors(self):
         return MONITORS
@@ -66,6 +67,9 @@ class FakeSession(BaseSession):
 
     def seconds_since_key(self):
         return self.key_age
+
+    def overview_open(self):
+        return self.overview
 
     def super_tapped(self):
         taps, self.super_taps = self.super_taps, 0
@@ -488,6 +492,38 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(self.wait_for(
             lambda: any(abs(x - 2900) < 150 and abs(y - 400) < 150 for x, y in self.os.warps), 4))
 
+    # --- the click by looking only happens inside the all-apps view ----------
+    def test_opening_the_overview_by_any_means_starts_the_session_and_closing_it_ends_it(self):
+        e = self.ready_for_super()
+        self.os.overview = True                                            # opened by the keyboard, a corner...
+        self.assertTrue(self.wait_for(lambda: e.in_session))
+        self.assertEqual(self.os.pressed, [])
+        FakeTracker.face = looking_at(2900, 400)
+        self.assertTrue(self.wait_for(
+            lambda: any(abs(x - 2900) < 150 and abs(y - 400) < 150 for x, y in self.os.warps), 4))
+        self.os.overview = False                                           # picked an app / pressed Esc
+        self.assertTrue(self.wait_for(lambda: not e.in_session))
+        warps = len(self.os.warps)
+        time.sleep(0.5)
+        self.assertEqual(len(self.os.warps), warps)
+
+    def test_looking_never_clicks_outside_the_overview(self):
+        e = self.ready_for_super(dwell_ms=300)
+        self.os.overview = False                                           # Super did not open anything
+        self.press_super()                                                 # (a gesture started a session anyway)
+        FakeTracker.face = looking_at(2900, 400)
+        time.sleep(1.5)
+        self.assertEqual(self.os.clicks, 0)
+        self.assertEqual(self.os.warps, [])                                # and the pointer is left alone
+
+    def test_when_the_overview_cannot_be_seen_the_pointer_follows_but_nothing_is_clicked(self):
+        e = self.ready_for_super(dwell_ms=300)                             # overview unknown (None)
+        self.press_super()
+        FakeTracker.face = looking_at(2900, 400)
+        self.assertTrue(self.wait_for(lambda: len(self.os.warps) > 3, 4))
+        time.sleep(1.0)
+        self.assertEqual(self.os.clicks, 0)
+
     def test_super_on_the_keyboard_also_starts_the_session(self):
         e = self.ready_for_super()
         self.os.super_taps = 1                                             # the real key: no gesture involved
@@ -513,6 +549,7 @@ class EngineTest(unittest.TestCase):
 
     def test_looking_at_one_spot_for_a_while_clicks_it_and_ends_the_session(self):
         e = self.ready_for_super(dwell_ms=300)
+        self.os.overview = True
         self.press_super()
         FakeTracker.face = looking_at(2900, 400)
         self.assertTrue(self.wait_for(lambda: self.os.clicks == 1, 5))

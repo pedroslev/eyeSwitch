@@ -78,6 +78,11 @@ class BaseSession:
         the last call. Super with another key (Super+Tab...) is not a tap. False where it cannot be watched."""
         return False
 
+    def overview_open(self):
+        """Is the system's all-apps view (GNOME's overview, macOS Mission Control) open right now?
+        True / False, or None when this backend cannot tell."""
+        return None
+
     def grab_hotkey(self):
         """Register Ctrl+Shift+G for hotkey_pressed(). Returns False if unavailable."""
         raise NotImplementedError

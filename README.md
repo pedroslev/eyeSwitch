@@ -165,8 +165,13 @@ Per gesture you choose what it does:
 A gesture fires once when held for its hold time (default 250 ms), and again only after the face
 relaxes.
 
-**The overview session.** A gesture that presses keys (say, mouth open for `super`) starts a session of a few
-seconds (default 6). The overview is drawn by the system above every window, so the test dot cannot be seen
+**The overview session.** It lives inside the system's all-apps view (GNOME's overview), and **only there**:
+looking at things never clicks anywhere else. eyeSwitch asks GNOME Shell whether the overview is open (it is
+told when that changes, so it costs nothing): opening it, by the Super key, by a gesture that presses `super`,
+by a hot corner, starts the session, and closing it ends it. The pointer does not move and nothing is clicked
+while it is closed. Where the overview cannot be seen (another desktop, Windows, macOS, which does not
+have this yet), a key gesture or Super still starts a short session of a few seconds (default 6) where the pointer
+follows the gaze, but **nothing is clicked by looking**: use a click gesture. The overview is drawn by the system above every window, so the test dot cannot be seen
 there, and its windows are rearranged into a grid, so "the window under your gaze" is no longer where it
 was on the desktop. What the system does know is where each thumbnail is, and it shows that through the
 **mouse pointer**: so during the session **the pointer follows your gaze** (the system draws it above the

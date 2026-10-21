@@ -731,7 +731,8 @@ class GesturesDialog(QDialog):
         self.dwell.setSpecialValueText("off")
         self.dwell.setValue(int(self.g.get("dwell_ms", 1200)))
         self.dwell.setToolTip("During that time, looking at one spot for this long clicks it, so you can pick "
-                              "an app with your eyes alone. Off: use a click gesture instead.")
+                              "an app with your eyes alone. It only clicks while the all-apps view (GNOME's overview) is open, "
+                              "never anywhere else. Off: use a click gesture instead.")
         self.dwell.valueChanged.connect(self._dwell)
         form = QFormLayout()
         form.addRow("How long that lasts (no automatic focus changes either)", self.pause)
