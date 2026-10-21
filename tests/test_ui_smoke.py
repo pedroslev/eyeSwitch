@@ -147,6 +147,9 @@ class GesturesScreenTest(unittest.TestCase):
     def test_the_overview_controls_write_to_the_config(self):
         dlg = es.GesturesDialog(None, self.engine, self.cfg)                    # the config has none of these keys yet
         self.assertTrue(dlg.cursor.isChecked())
+        self.assertTrue(dlg.kb_super.isChecked())
+        dlg.kb_super.setChecked(False)
+        self.assertFalse(self.cfg["gestures"]["keyboard_super"])
         self.assertEqual(dlg.dwell.value(), 1200)
         dlg.cursor.setChecked(False)
         dlg.dwell.setValue(0)

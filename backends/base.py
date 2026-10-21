@@ -73,6 +73,11 @@ class BaseSession:
         """Give keyboard focus to the window and raise it."""
         raise NotImplementedError
 
+    def super_tapped(self):
+        """True once per tap of the Super (Windows / Command) key on its own, as seen on the real keyboard since
+        the last call. Super with another key (Super+Tab...) is not a tap. False where it cannot be watched."""
+        return False
+
     def grab_hotkey(self):
         """Register Ctrl+Shift+G for hotkey_pressed(). Returns False if unavailable."""
         raise NotImplementedError

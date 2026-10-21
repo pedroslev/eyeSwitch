@@ -700,6 +700,11 @@ class GesturesDialog(QDialog):
                                "seen there. The mouse pointer can: it follows your gaze and the system highlights "
                                "what is under it. Needs the full calibration.")
         self.cursor.toggled.connect(self._cursor)
+        self.kb_super = QCheckBox("Also when I press Super on the keyboard")
+        self.kb_super.setChecked(self.g.get("keyboard_super", True))
+        self.kb_super.setToolTip("Tapping Super on its own (not Super+Tab...) opens the overview, and the pointer "
+                                 "follows your gaze there just as after a gesture. Linux (X11) only for now.")
+        self.kb_super.toggled.connect(self._kb_super)
         self.hand = QCheckBox("Pause / resume eyeSwitch with a hand: open palm, then close it into a fist")
         self.hand.setChecked(self.g.get("hand_toggle", False))
         self.hand.setToolTip("Suspended means the flag is off but the camera keeps watching, so the same gesture "
@@ -748,6 +753,7 @@ class GesturesDialog(QDialog):
         layout.setSpacing(10)
         layout.addWidget(self.enabled)
         layout.addWidget(self.cursor)
+        layout.addWidget(self.kb_super)
         layout.addWidget(self.hand)
         layout.addWidget(self.hand_live)
         hand_row = QHBoxLayout()
@@ -842,6 +848,10 @@ class GesturesDialog(QDialog):
         self.g.pop("hand_poses", None)
         self.engine.gestures_changed()
         self._hand_status()
+
+    def _kb_super(self, on):
+        self.g["keyboard_super"] = on
+        self.engine.gestures_changed()
 
     def _cursor(self, on):
         self.g["gaze_cursor"] = on

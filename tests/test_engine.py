@@ -27,7 +27,7 @@ A, B, C = 1, 2, 3
 class FakeSession(BaseSession):
     def __init__(self):
         self.active, self.activated, self.warps, self.key_age = A, [], [], 99.0
-        self.pressed, self.clicks, self.ptr = [], 0, (100, 100)
+        self.pressed, self.clicks, self.ptr, self.super_taps = [], 0, (100, 100), 0
 
     def monitors(self):
         return MONITORS
@@ -66,6 +66,10 @@ class FakeSession(BaseSession):
 
     def seconds_since_key(self):
         return self.key_age
+
+    def super_tapped(self):
+        taps, self.super_taps = self.super_taps, 0
+        return taps > 0
 
     def exists(self, wid):
         return wid in WINDOWS
@@ -483,6 +487,29 @@ class EngineTest(unittest.TestCase):
         FakeTracker.face = looking_at(2900, 400)                           # looking at an app in the overview
         self.assertTrue(self.wait_for(
             lambda: any(abs(x - 2900) < 150 and abs(y - 400) < 150 for x, y in self.os.warps), 4))
+
+    def test_super_on_the_keyboard_also_starts_the_session(self):
+        e = self.ready_for_super()
+        self.os.super_taps = 1                                             # the real key: no gesture involved
+        self.assertTrue(self.wait_for(lambda: e.in_session))
+        self.assertEqual(self.os.pressed, [])                              # nothing was pressed for the user
+        FakeTracker.face = looking_at(2900, 400)
+        self.assertTrue(self.wait_for(
+            lambda: any(abs(x - 2900) < 150 and abs(y - 400) < 150 for x, y in self.os.warps), 4))
+
+    def test_super_on_the_keyboard_can_be_turned_off_and_does_nothing_while_suspended(self):
+        e = self.ready_for_super(keyboard_super=False)
+        self.os.super_taps = 1
+        time.sleep(0.5)
+        self.assertFalse(e.in_session)
+        e.cfg["gestures"]["keyboard_super"] = True
+        e._set_suspended(True)
+        self.os.super_taps = 1
+        time.sleep(0.5)
+        self.assertFalse(e.in_session)
+        e._set_suspended(False)
+        self.os.super_taps = 1
+        self.assertTrue(self.wait_for(lambda: e.in_session))
 
     def test_looking_at_one_spot_for_a_while_clicks_it_and_ends_the_session(self):
         e = self.ready_for_super(dwell_ms=300)

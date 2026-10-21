@@ -42,6 +42,7 @@ DEFAULTS = {
     "gestures": {               # facial gestures that press keys; bindings come from the Gestures dialog
         "enabled": False,
         "pause_s": 6.0,         # an "overview session" after a key gesture lasts this long (and no automatic focus changes)
+        "keyboard_super": True, # the Super key on the real keyboard starts that session too
         "gaze_cursor": True,    # during that session the mouse pointer follows your gaze (the overview hides any overlay)
         "dwell_ms": 1200,       # ...and looking at one spot this long clicks it (0 = off)
         "hand_toggle": False,   # an open palm closing into a fist suspends / resumes eyeSwitch (watches for a hand)
@@ -702,6 +703,16 @@ class Engine:
 
             if getattr(tracker, "recognizer", None) is not None:
                 tracker.hand_urgent = starting
+
+            # Super on the keyboard opens the overview by itself: the pointer follows the gaze from there too.
+            if (xs.super_tapped() and self.cfg["gestures"].get("keyboard_super", True) and not self.suspended
+                    and not self.calibrating):
+                seconds = float(self.cfg["gestures"].get("pause_s", 6.0))
+                if self._start_session(seconds):
+                    suppress_until = max(suppress_until, now + seconds)
+                    px, py = xs.pointer()
+                    session = now < self.session_until
+                    self.gesture_log = "Super: the pointer follows your gaze, look at what you want"
 
             # Overview session: the pointer follows the gaze; one spot held long enough is a click.
             dwell_ms = int(self.cfg["gestures"].get("dwell_ms", 1200))

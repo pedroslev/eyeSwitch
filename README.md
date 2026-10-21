@@ -190,6 +190,12 @@ model, downloaded once); the sequence (a held palm, then a fist within 2 s, then
 meant to be deliberate, so a hand resting on the keyboard does not trigger it. Show the palm facing the camera
 for half a second, then close the hand; the Gestures screen shows what the camera sees as "Hand now".
 
+**Super on the keyboard works too.** Tapping Super on its own (not Super+Tab or other shortcuts) starts the same
+session: the overview opens as usual and the pointer follows your gaze, so you can pick the app with your eyes
+and look at it for a moment (or use a click gesture). No gesture is needed. It is seen through X11's RECORD
+extension, which only observes the keyboard (nothing is grabbed or delayed), so it is Linux (X11) only for now;
+turn it off with *Also when I press Super on the keyboard* in Gestures.
+
 **Train the hand.** The ready-made recognizer reads other people's hands and may misjudge yours, a palm seen
 from the side, or a camera angle that is not frontal. *Train hand...* in Gestures records about 15 seconds of
 your own open palm, fist and resting hand and learns to tell them apart (the way face gestures are trained,

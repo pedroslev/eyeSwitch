@@ -1,8 +1,10 @@
 """X11 backend: RandR monitors, EWMH window focus, pointer warp, XGrabKey hotkey."""
+import threading
 import time
 
 from Xlib import X, XK, display, protocol
-from Xlib.ext import xtest
+from Xlib.ext import record, xtest
+from Xlib.protocol import rq
 from Xlib.error import CatchError
 
 from .base import BaseSession, Monitor
@@ -107,6 +109,54 @@ class Session(BaseSession):
 
     def window_bounds(self, wid):
         return self._bounds(wid)
+
+    MAX_TAP_S = 2.0
+
+    def super_tapped(self):
+        """Taps of the Super key on the real keyboard, seen through the RECORD extension (it only observes:
+        nothing is grabbed or delayed). A tap is Super pressed and released with no other key in between."""
+        if not hasattr(self, "_taps"):
+            self._taps, self._lock = 0, threading.Lock()
+            threading.Thread(target=self._record_keys, daemon=True).start()
+        with self._lock:
+            taps, self._taps = self._taps, 0
+        return taps > 0
+
+    def _record_keys(self):
+        try:
+            d = display.Display()
+            if not d.has_extension("RECORD"):
+                return
+            supers = {d.keysym_to_keycode(XK.string_to_keysym(n)) for n in ("Super_L", "Super_R")} - {0}
+            state = {"since": None, "alone": False}
+
+            def handle(reply):
+                if reply.category != record.FromServer or reply.client_swapped or not reply.data or reply.data[0] < 2:
+                    return
+                data = reply.data
+                while data:
+                    event, data = rq.EventField(None).parse_binary_value(data, d.display, None, None)
+                    now = time.monotonic()
+                    if event.type == X.KeyPress:
+                        if event.detail in supers:
+                            if state["since"] is None:
+                                state["since"], state["alone"] = now, True
+                        elif state["since"] is not None:
+                            state["alone"] = False           # Super+something: a shortcut, not a tap
+                    elif event.type == X.KeyRelease and event.detail in supers and state["since"] is not None:
+                        if state["alone"] and now - state["since"] <= self.MAX_TAP_S:
+                            with self._lock:
+                                self._taps += 1
+                        state["since"] = None
+
+            ctx = d.record_create_context(0, [record.AllClients], [{
+                "core_requests": (0, 0), "core_replies": (0, 0), "ext_requests": (0, 0, 0, 0),
+                "ext_replies": (0, 0, 0, 0), "delivered_events": (0, 0),
+                "device_events": (X.KeyPress, X.KeyRelease), "errors": (0, 0),
+                "client_started": False, "client_died": False}])
+            d.record_enable_context(ctx, handle)             # blocks, calling handle for every key event
+        except Exception as e:                                # no RECORD, or the display went away
+            print(f"cannot watch the Super key: {e}", file=__import__("sys").stderr)
 
     _KEYSYMS = {"super": "Super_L", "ctrl": "Control_L", "shift": "Shift_L", "alt": "Alt_L",
                 "enter": "Return", "esc": "Escape", "tab": "Tab", "space": "space", "left": "Left",
