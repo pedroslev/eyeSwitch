@@ -3,7 +3,8 @@
 Two MediaPipe graphs (face and hand) in one process crashed the whole app with "Fatal Python error:
 none_dealloc" on a real session. Here a crash only costs the hand signal, and the 25-30 ms per recognition
 leaves the tracking thread. Protocol on stdin/stdout, little-endian: request = width, height, timestamp ms
-(3 x uint32) + RGB bytes; reply = one text line "name score" or "-".
+(3 x uint32) + RGB bytes; reply = one text line "name score" followed by the 21 hand landmarks as 63 numbers
+(x, y, z in pixels of the picture sent), or "-" when no hand is seen.
 """
 import struct
 import sys
@@ -33,7 +34,11 @@ def serve(model_path, stdin=None, stdout=None):
         rgb = np.frombuffer(data, np.uint8).reshape(h, w, 3)
         res = recognizer.recognize_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts)
         top = res.gestures[0][0] if res.gestures else None
-        stdout.write((f"{top.category_name} {top.score:.3f}\n" if top else "-\n").encode())
+        if top and res.hand_landmarks:
+            pts = " ".join(f"{p.x * w:.1f} {p.y * h:.1f} {p.z * w:.1f}" for p in res.hand_landmarks[0])
+            stdout.write(f"{top.category_name} {top.score:.3f} {pts}\n".encode())
+        else:
+            stdout.write(b"-\n")
         stdout.flush()
 
 

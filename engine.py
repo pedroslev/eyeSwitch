@@ -15,7 +15,7 @@ import virtualcam
 from backends.base import parse_keys
 from camwatch import CameraWatcher
 from gaze import FixationFilter, GazeModel, OneEuro
-from gestures import Detector, GestureModel, HandToggle
+from gestures import Detector, GestureModel, HandPoses, HandToggle
 from samples import PAD_AFTER, BlinkDetector, clean_capture, clean_indices
 from tracker import Face, HeadTracker
 
@@ -182,7 +182,7 @@ class Camera:
         cfg = self.engine.cfg
         return (cfg["camera"], bool(cfg["virtual_camera"]) and virtualcam.AVAILABLE,
                 self.engine.want_shapes or bool(self.engine.active_gestures()) or cfg["mode"] == "window",
-                cfg["camera_height"], cfg["tracking_fps"], bool(cfg["gestures"].get("hand_toggle", False)))
+                cfg["camera_height"], cfg["tracking_fps"], bool(cfg["gestures"].get("hand_toggle", False)) or self.engine.hand_wanted > 0)
 
     def _watch(self, cam):
         path = f"/dev/video{cam}"
@@ -287,6 +287,8 @@ class Engine:
         self.gaze_live = None           # the same, continuously smoothed: what the test dot shows
         self.vcam_state = "off"         # off / active / not set up / error: ...
         self.want_shapes = False        # the Gestures dialog is training: blendshapes are needed
+        self.hand_wanted = 0            # the hand is being trained (or looked at): watch it, fast
+        self._hand_capture, self._hand_stamp, self._poses_version = None, 0, -1
         self.gestures_version = 0       # bumped when the bindings change
         self.gesture_scores = {}        # label -> latest score (0 relaxed, 1 gesture), for live feedback
         self.gesture_log = ""           # what the last gesture did, or why it failed
@@ -388,6 +390,16 @@ class Engine:
         """Blendshape dicts seen since begin_shape_capture()."""
         with self._lock:
             samples, self._shape_capture = self._shape_capture or [], None
+        return samples
+
+    def begin_hand_capture(self):
+        with self._lock:
+            self._hand_capture = []
+
+    def end_hand_capture(self):
+        """Hand pose dicts (see gestures.hand_features) seen since begin_hand_capture()."""
+        with self._lock:
+            samples, self._hand_capture = self._hand_capture or [], None
         return samples
 
     def _render_preview(self, tracker, face, frame):
@@ -528,9 +540,9 @@ class Engine:
             top = time.monotonic()
             if cand is not None:
                 active_until = max(active_until, top + CALM_S)          # a decision is pending: stay sharp
-            force = (self.calibrating or self.preview_wanted > 0 or self.want_shapes or top < self.session_until
+            force = (self.calibrating or self.preview_wanted > 0 or self.want_shapes or self.hand_wanted > 0 or top < self.session_until
                      or (window_mode_cfg(self) and self.cfg["show_gaze"]))
-            forced_view = self.calibrating or self.preview_wanted > 0 or self.want_shapes
+            forced_view = self.calibrating or self.preview_wanted > 0 or self.want_shapes or self.hand_wanted > 0
             full = (((not self.cfg.get("adaptive_rate", True)) or force or top < active_until)
                     and not (self.suspended and not forced_view))         # suspended: only watching, at the idle rate
             self.tracking_rate = camera.tracker.max_fps if full else IDLE_FPS
@@ -579,13 +591,27 @@ class Engine:
                         current = wm
 
             # The hand toggle: an open palm, then a fist.
-            if self.cfg["gestures"].get("hand_toggle", False):
+            tracker = camera.tracker
+            if getattr(tracker, "recognizer", None) is not None:
+                if self._poses_version != self.gestures_version:           # the user's own poses, when trained
+                    self._poses_version = self.gestures_version
+                    poses = self.cfg["gestures"].get("hand_poses")
+                    tracker.hand_poses = HandPoses.from_dict(poses) if poses else None
+                tracker.hand_fast = self.hand_wanted > 0
+                if tracker.hand_stamp != self._hand_stamp:
+                    self._hand_stamp = tracker.hand_stamp
+                    with self._lock:
+                        if self._hand_capture is not None and tracker.hand_features:
+                            self._hand_capture.append(dict(tracker.hand_features))
+            if self.cfg["gestures"].get("hand_toggle", False) or (
+                    self.hand_wanted > 0 and getattr(tracker, "recognizer", None) is not None):
                 hand_toggle = hand_toggle or HandToggle()
-                hand = getattr(camera.tracker, "hand", None)
+                hand = getattr(tracker, "hand", None)
                 self.hand_text = f"{hand[0]} {hand[1]:.2f}" if hand else "no hand"
-                if getattr(camera.tracker, "hand_recent", False):
+                if getattr(tracker, "hand_recent", False):
                     active_until = now + CALM_S
-                if hand_toggle.update(hand, now) and not self.calibrating:
+                if (self.cfg["gestures"].get("hand_toggle", False) and hand_toggle.update(hand, now)
+                        and not self.calibrating):
                     self._set_suspended(not self.suspended)
             else:
                 hand_toggle, self.hand_text = None, ""
@@ -654,18 +680,28 @@ class Engine:
 
             # Gestures
             shapes = camera.tracker.shapes
+            # A hand in front of the face (palm covering it, or beside it) makes the face model invent an open
+            # mouth: no face gesture counts while a hand is in view, and a gesture that starts to rise makes
+            # the hand watcher look at once, so the hand is noticed before the hold time is over.
+            hand_blocks = (getattr(tracker, "recognizer", None) is not None
+                           and getattr(tracker, "hand_in_view", lambda: False)())
+            starting = False
             for b, model, det in detectors:
                 relevant = not self.suspended or b.get("action") == "toggle"     # suspended: only the way back
-                score = model.score(shapes) if (shapes and relevant) else None
+                score = model.score(shapes) if (shapes and relevant and not hand_blocks) else None
                 if score is not None:
                     self.gesture_scores[b["label"]] = score
                     if score > 0.2:
                         active_until = now + CALM_S                     # a gesture is starting: do not miss its hold
+                        starting = True
                 if det.update(score, now) and not self.calibrating:
                     quiet = self._fire(xs, b)
                     suppress_until = now + quiet if b.get("action") == "click" else max(suppress_until, now + quiet)
                     px, py = xs.pointer()                         # our own warp is not mouse activity
                     session = now < self.session_until
+
+            if getattr(tracker, "recognizer", None) is not None:
+                tracker.hand_urgent = starting
 
             # Overview session: the pointer follows the gaze; one spot held long enough is a click.
             dwell_ms = int(self.cfg["gestures"].get("dwell_ms", 1200))

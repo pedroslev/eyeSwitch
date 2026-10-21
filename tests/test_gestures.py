@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from gestures import Detector, GestureModel, HandToggle, train  # noqa: E402
+from gestures import Detector, GestureModel, HandPoses, HandToggle, hand_features, train  # noqa: E402
 
 NAMES = ["_neutral", "browInnerUp", "browOuterUpLeft", "mouthRollLower", "mouthPressLeft", "jawOpen",
          "eyeBlinkLeft", "mouthSmileLeft"]
@@ -124,6 +124,53 @@ class HandToggleTest(unittest.TestCase):
         fired = run_hand([(PALM, 0.4), (FIST, 0.3), (PALM, 0.4), (FIST, 0.3), (None, 0.3),
                           (None, 1.5), (PALM, 0.4), (FIST, 0.3)])
         self.assertEqual(len(fired), 2)                        # the second try came too soon, the third did not
+
+
+def hand(curl, scale=1.0, angle=0.0, seed=0):
+    """21 landmarks of a hand: wrist at the origin, fingers pointing up; `curl` 0 = open, 1 = fist."""
+    rng = np.random.default_rng(seed)
+    pts = np.zeros((21, 3))
+    pts[9] = (0, 100, 0)
+    for k, (knuckle, x) in enumerate(zip((2, 5, 9, 13, 17), (-60, -30, 0, 30, 60))):
+        base = np.array([x, 100 if k else 40, 0.0])
+        pts[knuckle] = base
+        length = 80 if k else 50
+        for j in range(1, 4):
+            ext = 1 - curl * (0.2 * j + 0.4)                       # curled fingers fold back toward the palm
+            pts[knuckle + j] = base + (0, length * j / 3 * ext * 1.0, -curl * 30 * j / 3)
+    pts += rng.normal(0, 1.0, pts.shape)
+    c, s_ = np.cos(angle), np.sin(angle)
+    pts[:, :2] = pts[:, :2] @ np.array([[c, -s_], [s_, c]])
+    return pts * scale
+
+
+class HandPosesTest(unittest.TestCase):
+    def poses(self, seed):
+        return ([hand_features(hand(0.0, seed=seed + i)) for i in range(30)],
+                [hand_features(hand(1.0, seed=seed + 50 + i)) for i in range(30)],
+                [hand_features(hand(0.45, seed=seed + 90 + i)) for i in range(30)])
+
+    def test_features_do_not_depend_on_distance_or_direction(self):
+        near, far = hand_features(hand(0.0, scale=2.0)), hand_features(hand(0.0, scale=0.5, angle=1.1))
+        for k in near:
+            self.assertAlmostEqual(near[k], far[k], delta=0.08)
+
+    def test_tells_the_open_palm_the_fist_and_a_resting_hand_apart(self):
+        poses = HandPoses.train(*self.poses(1))
+        self.assertTrue(poses.reliable)
+        opened, fist, rest = self.poses(500)
+        self.assertGreater(np.mean([poses.verdict(f) is not None and poses.verdict(f)[0] == "Open_Palm" for f in opened]), 0.9)
+        self.assertGreater(np.mean([poses.verdict(f) is not None and poses.verdict(f)[0] == "Closed_Fist" for f in fist]), 0.9)
+        self.assertLess(np.mean([poses.verdict(f) is not None for f in rest]), 0.2)       # neither
+
+    def test_roundtrip_and_works_with_hand_toggle(self):
+        poses = HandPoses.from_dict(HandPoses.train(*self.poses(1)).to_dict())
+        opened, fist, _ = self.poses(700)
+        det, t, fired = HandToggle(), 0.0, 0
+        for f in [opened[0]] * 8 + [fist[0]] * 4:
+            fired += det.update(poses.verdict(f), t)
+            t += 0.1
+        self.assertEqual(fired, 1)
 
 
 if __name__ == "__main__":

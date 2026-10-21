@@ -596,6 +596,90 @@ class GestureRow(QWidget):
             self.status.setToolTip("Uses: " + ", ".join(m.names))
 
 
+class HandTrainDialog(QDialog):
+    """Records the user's open palm, fist and resting hand, and trains the hand poses from them."""
+    REACT_MS, RECORD_MS, MIN_SAMPLES = 1800, 2500, 12
+    STEPS = (("open", "Show your OPEN PALM to the camera, the way you will do it, and hold it"),
+             ("fist", "Now close it into a FIST and hold it"),
+             ("rest", "Now your hand as it usually is: resting on the keyboard or the mouse, relaxed"))
+
+    def __init__(self, parent, engine, on_done):
+        super().__init__(parent)
+        self.setWindowTitle("Train hand")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+        self.engine, self.on_done, self.finished_, self.samples, self.step = engine, on_done, False, {}, 0
+        self.text = QLabel("Getting the camera ready...")
+        f = self.text.font()
+        f.setPointSize(f.pointSize() + 2)
+        f.setBold(True)
+        self.text.setFont(f)
+        self.text.setWordWrap(True)
+        self.text.setAlignment(Qt.AlignCenter)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.addWidget(self.text)
+        layout.addWidget(cancel)
+        engine.hand_wanted += 1
+        engine.calibrating = True                          # camera on, nothing acts meanwhile
+        self.t0 = time.monotonic()
+        self.poll = QTimer(self)
+        self.poll.timeout.connect(self._ready)
+        self.poll.start(100)
+
+    def _ready(self):
+        if getattr(self.engine, "hand_text", ""):          # the recognizer has answered: it is running
+            self.poll.stop()
+            self._next()
+        elif time.monotonic() - self.t0 > 20:
+            self._finish(None, "The hand recognizer did not start. Is another app using the camera?")
+
+    def _later(self, ms, then):
+        QTimer.singleShot(ms, lambda: not self.finished_ and then())
+
+    def _next(self):
+        if self.step >= len(self.STEPS):
+            return self._train()
+        self.text.setText(f"{self.step + 1}/3  {self.STEPS[self.step][1]}")
+        self._later(self.REACT_MS, self._record)
+
+    def _record(self):
+        self.engine.begin_hand_capture()
+        self.text.setText(self.text.text() + "\n...recording")
+        self._later(self.RECORD_MS, self._stop)
+
+    def _stop(self):
+        name = self.STEPS[self.step][0]
+        self.samples[name] = self.engine.end_hand_capture()
+        if len(self.samples[name]) < self.MIN_SAMPLES:
+            return self._finish(None, "Your hand was not detected clearly enough. Keep it in view of the camera, "
+                                      "not too close, and try again.")
+        self.step += 1
+        self._next()
+
+    def _train(self):
+        model = gestures.HandPoses.train(self.samples["open"], self.samples["fist"], self.samples["rest"])
+        self._finish(model, "")
+
+    def _finish(self, model, message):
+        if self.finished_:
+            return
+        self.finished_ = True
+        self.engine.hand_wanted = max(0, self.engine.hand_wanted - 1)
+        self.engine.calibrating = False
+        self.accept()
+        self.on_done(model, message)
+
+    def reject(self):
+        if not self.finished_:
+            self.finished_ = True
+            self.engine.hand_wanted = max(0, self.engine.hand_wanted - 1)
+            self.engine.calibrating = False
+        super().reject()
+
+
 class GesturesDialog(QDialog):
     def __init__(self, parent, engine, cfg):
         super().__init__(parent)
@@ -626,6 +710,15 @@ class GesturesDialog(QDialog):
         self.hand.toggled.connect(self._hand)
         self.hand_live = QLabel()
         self.hand_live.setEnabled(False)
+        self.hand_train = QPushButton("Train hand...")
+        self.hand_train.setToolTip("Teach eyeSwitch your own open palm, fist and resting hand (about 15 seconds). "
+                                   "Without it the ready-made recognizer is used, which reads other people's hands.")
+        self.hand_train.clicked.connect(self._train_hand)
+        self.hand_reset = QPushButton("Use the generic one")
+        self.hand_reset.clicked.connect(self._reset_hand)
+        self.hand_status = QLabel()
+        self.hand_status.setWordWrap(True)
+        self._hand_status()
         self.dwell = QSpinBox()
         self.dwell.setRange(0, 5000)
         self.dwell.setSingleStep(100)
@@ -657,6 +750,11 @@ class GesturesDialog(QDialog):
         layout.addWidget(self.cursor)
         layout.addWidget(self.hand)
         layout.addWidget(self.hand_live)
+        hand_row = QHBoxLayout()
+        hand_row.addWidget(self.hand_train)
+        hand_row.addWidget(self.hand_reset)
+        layout.addLayout(hand_row)
+        layout.addWidget(self.hand_status)
         layout.addLayout(form)
         layout.addLayout(self.rows_box)
         buttons = QHBoxLayout()
@@ -717,6 +815,33 @@ class GesturesDialog(QDialog):
     def _hand(self, on):
         self.g["hand_toggle"] = on
         self.engine.gestures_changed()
+
+    def _hand_status(self):
+        poses = self.g.get("hand_poses")
+        quality = min(poses["open"]["quality"], poses["fist"]["quality"]) if poses else None
+        self.hand_status.setText(
+            "Using the generic hand recognizer." if not poses else
+            f"Trained on your hand (separation {quality:.1f}" + ("): good." if quality >= gestures.MIN_QUALITY else
+                                                                  "): weak, train again with clearer poses."))
+        self.hand_reset.setEnabled(bool(poses))
+
+    def _train_hand(self):
+        def done(model, message):
+            if model is None:
+                QMessageBox.warning(self, "Train hand", message)
+            else:
+                self.g["hand_poses"] = model.to_dict()
+                self.engine.gestures_changed()
+                self._hand_status()
+                if not model.reliable:
+                    QMessageBox.information(self, "Train hand", "The poses look too alike to tell apart reliably. "
+                                            "Make the palm fully open and the fist tight, and train again.")
+        HandTrainDialog(self, self.engine, done).exec()
+
+    def _reset_hand(self):
+        self.g.pop("hand_poses", None)
+        self.engine.gestures_changed()
+        self._hand_status()
 
     def _cursor(self, on):
         self.g["gaze_cursor"] = on

@@ -12,6 +12,7 @@ from collections import namedtuple
 import cv2
 import numpy as np
 
+from gestures import hand_features
 from handworker import HEADER
 from virtualcam import LABEL as VIRTUAL_LABEL
 
@@ -79,6 +80,7 @@ HAND_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gest
 # 10 per second only while a hand is around, which is when a palm-then-fist needs timing.
 HAND_INTERVAL_IDLE, HAND_INTERVAL_NEAR, HAND_NEAR_S = 0.3, 0.1, 3.0
 HAND_WIDTH = 640
+HAND_BLOCK_S = 1.0       # face gestures are ignored this long after a hand was last seen
 SIGNAL_POSES = ("Open_Palm", "Closed_Fist")    # only these mean someone is signalling; a hand resting on the
                                                  # keyboard is "None" and must not speed anything up
 
@@ -127,7 +129,7 @@ class HandProcess:
             self._died()
 
     def poll(self):
-        """The newest verdict ((name, score) or None) if an answer came, else NOTHING_NEW."""
+        """The newest verdict ((name, score, 21x3 landmarks) or None) if an answer came, else NOTHING_NEW."""
         verdict = self.NOTHING_NEW
         while True:
             try:
@@ -140,12 +142,22 @@ class HandProcess:
             if line == "ready":
                 continue
             self.busy = False
-            name, _, score = line.partition(" ")
-            verdict = None if name == "-" else (name, float(score))
+            if line == "-":
+                verdict = None
+            else:
+                name, score, *points = line.split()
+                verdict = (name, float(score), np.array(points, float).reshape(21, 3))
 
     def _died(self):
         """A crash of the recognizer costs only the hand signal: try again a few times, then give up."""
         self.busy = False
+        for pipe in (self.proc.stdin, self.proc.stdout):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+        self.proc.kill()
+        self.proc.wait()
         if self.restarts < self.MAX_RESTARTS:
             self.restarts += 1
             print("hand recognizer stopped; restarting it", file=sys.stderr)
@@ -191,6 +203,8 @@ class HeadTracker:
         self.blink = None            # mean eyelid closure score 0..1 (needs blendshapes)
         self.landmarker = vision.FaceLandmarker.create_from_options(opts)
         self.face_enabled, self.hand, self.recognizer, self._last_hand, self._hand_seen = True, None, None, 0.0, -1e9
+        self.hand_poses, self.hand_features, self.hand_stamp, self.hand_fast = None, None, 0, False
+        self.hand_urgent, self._hand_any = False, -1e9
         self.set_hands(hands)
         self.max_fps = self.fps = fps
         self.min_interval = 0.8 / fps                # 0.8: do not skip frames to timing jitter
@@ -229,7 +243,14 @@ class HeadTracker:
         """Hand the frame to the recognizer process (when it is free) and pick up its latest answer."""
         verdict = self.recognizer.poll()
         if verdict is not HandProcess.NOTHING_NEW:
-            self.hand = verdict
+            self.hand_features = None if verdict is None else hand_features(verdict[2])
+            self.hand_stamp += 1
+            if verdict is not None:
+                self._hand_any = now
+            if self.hand_poses is not None:            # the user's own poses, when trained
+                self.hand = self.hand_poses.verdict(self.hand_features) if self.hand_features else None
+            else:
+                self.hand = verdict and verdict[:2]
             if self.hand and self.hand[0] in SIGNAL_POSES and self.hand[1] >= 0.5:
                 self._hand_seen = now
         if not self.recognizer.busy:
@@ -239,6 +260,11 @@ class HeadTracker:
             self.recognizer.submit(cv2.cvtColor(small, cv2.COLOR_BGR2RGB), int((now - self._t0) * 1000))
         if not self.recognizer.alive:
             self.hand = None
+
+    def hand_in_view(self, within=HAND_BLOCK_S):
+        """Any hand, in any pose, was seen in the last `within` seconds. A palm in front of the face (or beside
+        it) makes the face model invent expressions, so face gestures must not be believed then."""
+        return time.monotonic() - self._hand_any < within
 
     @property
     def hand_recent(self):
@@ -273,7 +299,8 @@ class HeadTracker:
                 break
         self._last = now
         if self.recognizer is not None and (self.recognizer.busy or now - self._last_hand >= (
-                HAND_INTERVAL_NEAR if now - self._hand_seen < HAND_NEAR_S else HAND_INTERVAL_IDLE)):
+                HAND_INTERVAL_NEAR if (self.hand_fast or self.hand_urgent
+                                       or now - self._hand_seen < HAND_NEAR_S) else HAND_INTERVAL_IDLE)):
             self._read_hand(frame, now)
         if not self.face_enabled:
             self.shapes = self.landmarks = self.blink = None

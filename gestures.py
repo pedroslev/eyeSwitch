@@ -125,3 +125,67 @@ class HandToggle:
                 if self.palm_seen is not None and now - self.palm_seen > self.WINDOW_S:
                     self.palm_seen = None
         return False
+
+
+FINGERS = ("thumb", "index", "middle", "ring", "pinky")
+TIPS, KNUCKLES = (4, 8, 12, 16, 20), (2, 5, 9, 13, 17)
+
+
+def hand_features(points):
+    """Pose of a hand as {name: number} from its 21 landmarks (rows of x, y, z).
+
+    Only distances relative to the size of the palm, so they do not depend on how far the hand is, nor on
+    which way it points: how far each fingertip is from the wrist (extended or curled), from its own knuckle,
+    and how the thumb and the fingers are spread.
+    """
+    p = np.asarray(points, float).reshape(21, 3)
+    d = lambda a, b: float(np.linalg.norm(p[a] - p[b]))
+    palm = max(d(0, 9), 1e-6)
+    f = {}
+    for name, tip, knuckle in zip(FINGERS, TIPS, KNUCKLES):
+        f[f"reach_{name}"] = d(tip, 0) / palm
+        f[f"curl_{name}"] = d(tip, knuckle) / palm
+    f["thumb_index"] = d(4, 8) / palm
+    f["spread"] = d(8, 20) / palm
+    return f
+
+
+class HandPoses:
+    """The user's own open palm and fist, told apart from each other and from a resting hand.
+
+    The ready-made recognizer reads other people's hands and its own labels; this learns from a few seconds
+    of this user's hand (the way the face gestures are trained). One classifier per pose: "open" against
+    everything else, "fist" against everything else, so a hand resting on the keyboard is neither.
+    """
+    ON = 0.6
+
+    def __init__(self, open_model, fist_model):
+        self.open, self.fist = open_model, fist_model
+
+    @classmethod
+    def train(cls, open_, fist, rest):
+        return cls(train(fist + rest, open_), train(open_ + rest, fist))
+
+    @property
+    def quality(self):
+        return min(self.open.quality, self.fist.quality)
+
+    @property
+    def reliable(self):
+        return self.open.reliable and self.fist.reliable
+
+    def verdict(self, features):
+        """("Open_Palm" | "Closed_Fist", confidence) or None, in the form HandToggle takes."""
+        o, f = self.open.score(features), self.fist.score(features)
+        if o >= self.ON and o > f:
+            return "Open_Palm", min(o, 1.0)
+        if f >= self.ON:
+            return "Closed_Fist", min(f, 1.0)
+        return None
+
+    def to_dict(self):
+        return {"open": self.open.to_dict(), "fist": self.fist.to_dict()}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(GestureModel.from_dict(d["open"]), GestureModel.from_dict(d["fist"]))

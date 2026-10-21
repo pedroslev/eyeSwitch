@@ -23,7 +23,7 @@ import eyeswitch as es  # noqa: E402
 from test_engine import FakeSession  # noqa: E402
 from test_gestures import frames  # noqa: E402
 
-SOURCES = ["eyeswitch.py", "engine.py", "tracker.py", "gaze.py", "gestures.py", "samples.py", "preview.py",
+SOURCES = ["eyeswitch.py", "engine.py", "tracker.py", "handworker.py", "gaze.py", "gestures.py", "samples.py", "preview.py",
            "autostart.py", "camwatch.py", "virtualcam.py", "install.py"]
 
 
@@ -46,6 +46,7 @@ class FakeGestureEngine:
     def __init__(self):
         self.gesture_scores, self.gesture_log, self.changes = {}, "", 0
         self.want_shapes = self.calibrating = False
+        self.hand_wanted, self.hand_text = 0, ""
         self.shapes_seen, self.cap, self.captures = 0.0, None, 0
         self.relaxed, self.gesture = iter(frames(2000, 1)), iter(frames(2000, 2, browInnerUp=0.7, browOuterUpLeft=0.8))
 
@@ -123,6 +124,25 @@ class GesturesScreenTest(unittest.TestCase):
         dlg.hand.setChecked(False)
         dlg._live()
         self.assertEqual(dlg.hand_live.text(), "")
+
+    def test_training_the_hand_opens_and_saves_the_poses(self):
+        from tests.test_gestures import HandPosesTest
+        dlg = es.GesturesDialog(None, self.engine, self.cfg)
+        self.assertIn("generic", dlg.hand_status.text())
+        self.assertFalse(dlg.hand_reset.isEnabled())
+        opened, fist, rest = HandPosesTest().poses(1)
+        self.engine.hand_wanted = 0
+        train = es.HandTrainDialog(None, self.engine, lambda m, msg: None)      # it can be built and cancelled
+        self.assertEqual(self.engine.hand_wanted, 1)
+        train.reject()
+        self.assertEqual(self.engine.hand_wanted, 0)
+        poses = es.gestures.HandPoses.train(opened, fist, rest)
+        self.cfg["gestures"]["hand_poses"] = poses.to_dict()
+        dlg._hand_status()
+        self.assertIn("Trained", dlg.hand_status.text())
+        dlg._reset_hand()
+        self.assertNotIn("hand_poses", self.cfg["gestures"])
+        self.assertIn("generic", dlg.hand_status.text())
 
     def test_the_overview_controls_write_to_the_config(self):
         dlg = es.GesturesDialog(None, self.engine, self.cfg)                    # the config has none of these keys yet

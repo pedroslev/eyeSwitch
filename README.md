@@ -190,6 +190,17 @@ model, downloaded once); the sequence (a held palm, then a fist within 2 s, then
 meant to be deliberate, so a hand resting on the keyboard does not trigger it. Show the palm facing the camera
 for half a second, then close the hand; the Gestures screen shows what the camera sees as "Hand now".
 
+**Train the hand.** The ready-made recognizer reads other people's hands and may misjudge yours, a palm seen
+from the side, or a camera angle that is not frontal. *Train hand...* in Gestures records about 15 seconds of
+your own open palm, fist and resting hand and learns to tell them apart (the way face gestures are trained,
+from distances between the 21 hand points, so distance to the camera and direction do not matter). *Use the
+generic one* goes back.
+
+**A hand in view blocks the face gestures.** A palm over the face, or beside it, makes the face model invent
+expressions (an open mouth, for one). While the hand option is on, any hand seen in the last second cancels
+the face gestures, and a face gesture that starts to rise makes the hand watcher look at once. Without the
+hand option nothing watches for hands, so this protection needs it on.
+
 Eyebrows up works well. Subtler ones, like biting a lip, depend on your face and may rate as weak.
 Expressions in conversation can trigger gestures by accident: give them a longer hold, or pause
 eyeSwitch with Ctrl+Shift+G during a call. Key and click injection uses XTEST (X11), SendInput

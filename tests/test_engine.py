@@ -85,6 +85,7 @@ class FakeTracker:
     face, opens, closes, args = None, 0, 0, None     # args: (camera, has_sink) of the last open
     fail_open, no_frames, shapes_on, shapes = False, False, None, None
     hands_on, hand_verdict, face_enabled = False, None, True
+    hand_visible, hand_feat = False, None
     frame = np.zeros((48, 64, 3), np.uint8)
 
     def __init__(self, camera=0, sink=None, blendshapes=False, height="auto", fps=30, hands=False):
@@ -126,6 +127,17 @@ class FakeTracker:
 
     def set_face_enabled(self, on):
         FakeTracker.face_enabled = on
+
+    def hand_in_view(self, within=1.0):
+        return FakeTracker.hand_visible
+
+    @property
+    def hand_stamp(self):                                    # a new answer from the recognizer every 50 ms
+        return int(time.monotonic() * 20)
+
+    @property
+    def hand_features(self):
+        return FakeTracker.hand_feat
 
     @property
     def hand(self):
@@ -388,6 +400,38 @@ class EngineTest(unittest.TestCase):
         time.sleep(1.0)
         FakeTracker.shapes = {"browInnerUp": 0.7, "jawOpen": 0.0}
         self.assertTrue(self.wait_for(lambda: not e.suspended))
+
+    def test_a_hand_in_view_blocks_the_face_gestures(self):
+        # a palm over the face makes the face model read an open mouth: that must not press anything
+        e = self.gestures("monitor", binding("Mouth", "click", "", 100, "jawOpen"))
+        e.cfg["gestures"]["hand_toggle"] = True
+        e.gestures_changed()
+        FakeTracker.face = looking_at(500, 500)
+        FakeTracker.shapes = {"browInnerUp": 0.0, "jawOpen": 0.0}
+        self.assertTrue(self.wait_for(lambda: FakeTracker.hands_on))
+        time.sleep(0.3)
+        FakeTracker.hand_visible = True
+        FakeTracker.shapes = {"browInnerUp": 0.0, "jawOpen": 0.7}
+        time.sleep(0.8)
+        self.assertEqual(self.os.clicks, 0)
+        FakeTracker.hand_visible = False                                       # hand gone, mouth still open
+        FakeTracker.shapes = {"browInnerUp": 0.0, "jawOpen": 0.0}
+        time.sleep(0.4)
+        FakeTracker.shapes = {"browInnerUp": 0.0, "jawOpen": 0.7}
+        self.assertTrue(self.wait_for(lambda: self.os.clicks == 1))
+
+    def test_hand_poses_are_collected_while_training(self):
+        e = self.start("monitor")
+        FakeTracker.hand_feat = {"reach_index": 1.9}
+        e.hand_wanted += 1
+        self.assertTrue(self.wait_for(lambda: FakeTracker.hands_on))
+        time.sleep(0.3)
+        e.begin_hand_capture()
+        time.sleep(0.5)
+        samples = e.end_hand_capture()
+        e.hand_wanted -= 1
+        self.assertGreater(len(samples), 3)
+        self.assertEqual(samples[0], {"reach_index": 1.9})
 
     def test_while_suspended_it_barely_looks_unless_a_hand_is_around(self):
         self.calm_quickly()

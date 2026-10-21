@@ -76,6 +76,18 @@ class FaceTest(unittest.TestCase):
         self.assertAlmostEqual(_face(matrix(-10), landmarks(), W, H).yaw, -10, places=3)
 
 
+class HandAnswerTest(unittest.TestCase):
+    def test_a_reply_line_with_landmarks_is_parsed(self):
+        hand = HandProcess.__new__(HandProcess)
+        hand.busy, hand._answer = True, __import__("queue").Queue()
+        hand._answer.put("Open_Palm 0.91 " + " ".join(str(i) for i in range(63)))
+        name, score, points = hand.poll()
+        self.assertEqual((name, score, points.shape, points[1, 0]), ("Open_Palm", 0.91, (21, 3), 3.0))
+        self.assertFalse(hand.busy)
+        hand._answer.put("-")
+        self.assertIsNone(hand.poll())
+
+
 @unittest.skipUnless(os.path.exists(HAND_MODEL_PATH), "needs the hand model downloaded")
 class HandProcessTest(unittest.TestCase):
     """The recognizer lives in its own process: a crash there must not take the app down."""
