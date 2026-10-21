@@ -47,13 +47,14 @@ class GazeModel:
         self.hi = None if hi is None else np.asarray(hi, float)
         self.noise_px = noise_px            # scatter of the estimate while looking at one point
         self.point_errors = {}
+        self.seat = None                    # SeatCompensation, set by the calibration that made this model
 
     def _z(self, vec):
         return ((np.asarray(vec, float) - self.mean) / self.std)[self.active]
 
-    def predict(self, vec):
+    def predict(self, vec, clamp=True):
         z = self._z(vec)
-        if self.lo is not None:
+        if self.lo is not None and clamp:
             z = np.clip(z, self.lo, self.hi)
         x, y = (_expand(z[None], self.degree) @ self.weights)[0]
         return float(x), float(y)
@@ -69,12 +70,70 @@ class GazeModel:
         return {"degree": self.degree, "mean": self.mean.tolist(), "std": self.std.tolist(),
                 "weights": self.weights.tolist(), "error_px": self.error_px, "active": self.active,
                 "lo": None if self.lo is None else self.lo.tolist(),
-                "hi": None if self.hi is None else self.hi.tolist(), "noise_px": self.noise_px}
+                "hi": None if self.hi is None else self.hi.tolist(), "noise_px": self.noise_px,
+                "seat": None if self.seat is None else self.seat.to_dict()}
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d["degree"], d["mean"], d["std"], d["weights"], d.get("error_px"),
-                   d.get("active"), d.get("lo"), d.get("hi"), d.get("noise_px"))
+        model = cls(d["degree"], d["mean"], d["std"], d["weights"], d.get("error_px"),
+                    d.get("active"), d.get("lo"), d.get("hi"), d.get("noise_px"))
+        model.seat = SeatCompensation.from_dict(d["seat"]) if d.get("seat") else None
+        return model
+
+
+TX, TY, TZ = 2, 3, 4                     # columns of the face features that hold the head position (cm, camera frame)
+
+
+class SeatCompensation:
+    """Corrects the estimate for where the head is now compared with where it was at calibration.
+
+    The calibrated model answers "which point is this head and eye direction aimed at" for one seat position.
+    If the eye moves by (dx, dy) and the same direction is kept, the aimed point moves by (dx, dy) too; if the
+    eye moves away from the screen, the point moves out from the eye's own projection on the screen, in proportion
+    to the distance. With the eye's pixel position E0 at calibration and k = distance now / distance then:
+        point = E0 + (dx, dy) + k * (model_point - E0)
+    Head position is NOT a model input (its coefficients were fitted on ~0.5 cm of movement correlated with where
+    the person looked, and exploded); this uses geometry instead, with only one number guessed, the pixel density.
+    Camera axes: x grows to the user's left and y upwards, so desktop dx = -x and dy = -y.
+    """
+    K_RANGE = (0.6, 1.6)
+    MAX_SHIFT_CM = 40.0
+
+    def __init__(self, ref, px_per_cm, eye_px):
+        self.ref, self.px_per_cm, self.eye_px = [float(v) for v in ref], float(px_per_cm), [float(v) for v in eye_px]
+
+    @classmethod
+    def make(cls, model, features, px_per_cm):
+        """From the calibration's own rows: the median head position, and where the eye projects on the screen.
+        Horizontally that is what the model says for a head facing the camera (yaw 0, inside the calibrated range).
+        Vertically it is the middle of what was calibrated: the pitch at 0 is far outside that range (extrapolating
+        it put the eye 250 px below the screen on real data), so it is not asked."""
+        f = np.asarray(features, float)
+        ref = np.median(f[:, [TX, TY, TZ]], axis=0)
+        aim = f.mean(axis=0)
+        aim[0] = 0.0
+        return cls(ref, px_per_cm, model.predict(aim))
+
+    def offset_cm(self, vec):
+        """(right, up, farther) of where the head is now relative to calibration, as the user sees it, in cm."""
+        v = np.asarray(vec, float)
+        return (-(v[TX] - self.ref[0]), -(v[TY] - self.ref[1]), -(v[TZ] - self.ref[2]))
+
+    def apply(self, point, vec):
+        v = np.asarray(vec, float)
+        lim = self.MAX_SHIFT_CM
+        dx = -float(np.clip(v[TX] - self.ref[0], -lim, lim)) * self.px_per_cm
+        dy = -float(np.clip(v[TY] - self.ref[1], -lim, lim)) * self.px_per_cm
+        k = float(np.clip(v[TZ] / self.ref[2], *self.K_RANGE)) if self.ref[2] else 1.0
+        ex, ey = self.eye_px
+        return (ex + dx + k * (point[0] - ex), ey + dy + k * (point[1] - ey))
+
+    def to_dict(self):
+        return {"ref": self.ref, "px_per_cm": self.px_per_cm, "eye_px": self.eye_px}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d["ref"], d["px_per_cm"], d["eye_px"])
 
 
 def _informative(z, groups, cols):

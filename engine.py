@@ -14,7 +14,7 @@ import preview
 import virtualcam
 from backends.base import parse_keys
 from camwatch import CameraWatcher
-from gaze import FixationFilter, GazeModel, OneEuro
+from gaze import FixationFilter, GazeModel, OneEuro, SeatCompensation
 from gestures import Detector, GestureModel, HandPoses, HandToggle
 from samples import PAD_AFTER, BlinkDetector, clean_capture, clean_indices
 from tracker import Face, HeadTracker
@@ -32,6 +32,7 @@ DEFAULTS = {
     "show_gaze": False,         # draw the estimated gaze point (for testing)
     "virtual_camera": False,    # Linux: republish the camera as "eyeSwitch Camera" for video calls
     "calibration_preview": True,  # show the camera view in a corner while calibrating
+    "seat_compensation": True,   # correct the gaze for where the head is now compared with calibration
     "camera_height": "auto",    # "auto" = the camera's best (up to 1080p), or 1080 / 720; a gaze calibration
                                 # only fits the resolution it was made at
     "tracking_fps": 30,         # 30 or 15: tracking rate (the camera must deliver it); 30 reacts sooner and
@@ -312,6 +313,7 @@ class Engine:
         self.tracking_rate = None       # what the engine asked of the tracker last: full speed or IDLE_FPS
         self.session_start = self.session_until = 0.0    # "overview session": pointer follows the gaze until then
         self.in_session = False
+        self.px_per_cm, self.seat_cm = 36.0, None   # screen pixel density; how far the head is from where it calibrated
         self.overview, self._overview_was_open = None, False   # the system's all-apps view: True / False / None (unknown)
         self.suspended = False          # flag off but still watching: only a toggle gesture / the hand can undo it
         self.hand_text = ""             # what the hand recognizer sees right now, for the Gestures screen
@@ -334,6 +336,12 @@ class Engine:
                 model = GazeModel.from_dict(data["gaze"])
                 if len(model.mean) == len(Face._fields):
                     self.gaze_model = model
+                    if model.seat is None:             # saved before the seat correction: its own rows have what it needs
+                        try:
+                            rows = np.load(os.path.join(os.path.dirname(CALIB_PATH), "calibration_samples.npz"))["features"]
+                            model.seat = SeatCompensation.make(model, rows, self.px_per_cm)
+                        except (OSError, KeyError, ValueError):
+                            pass
                 else:
                     self.stale_model = True      # fitted on other features: its numbers mean nothing now
         except (FileNotFoundError, ValueError, KeyError):
@@ -365,6 +373,19 @@ class Engine:
         with open(CALIB_PATH, "w") as f:
             json.dump({"monitors": self.calib_monitors, "yaw": self.centers, "camera_height": self.calib_height,
                        "gaze": model.to_dict() if model else None}, f, indent=2)
+
+    SEAT_NOTE_CM = 5.0
+
+    def seat_note(self):
+        """A few words when the head is far from where it was at calibration (empty when close)."""
+        d = self.seat_cm
+        if d is None or max(abs(v) for v in d) < self.SEAT_NOTE_CM:
+            return ""
+        parts = [f"{abs(d[0]):.0f} cm {'right' if d[0] > 0 else 'left'}" if abs(d[0]) >= 2 else "",
+                 f"{abs(d[1]):.0f} cm {'up' if d[1] > 0 else 'down'}" if abs(d[1]) >= 2 else "",
+                 f"{abs(d[2]):.0f} cm {'farther' if d[2] > 0 else 'closer'}" if abs(d[2]) >= 2 else ""]
+        how = "compensating" if self.cfg.get("seat_compensation", True) else "not compensating"
+        return f"  (seat moved {', '.join(p for p in parts if p)} since calibration: {how}; recalibrate if it drifts)"
 
     def begin_capture(self):
         with self._lock:
@@ -508,6 +529,9 @@ class Engine:
     def _run(self):
         try:
             xs = backends.Session()
+            self.px_per_cm = xs.pixels_per_cm() or 36.0
+            if self.gaze_model is not None and self.gaze_model.seat is not None:
+                self.gaze_model.seat.px_per_cm = self.px_per_cm        # (a loaded calibration guessed it)
             hotkey_ok = xs.grab_hotkey()
         except Exception as e:
             self.status = f"Cannot start the {backends.platform_name()} backend: {e}"
@@ -685,6 +709,10 @@ class Engine:
                     pass                                             # hold the estimate through a blink
                 else:
                     raw = model.predict(vec)
+                    if model.seat is not None:
+                        self.seat_cm = model.seat.offset_cm(vec)
+                        if self.cfg.get("seat_compensation", True):
+                            raw = model.seat.apply(raw, vec)
                     g, live = gaze_filter.update(raw), live_filter.update(raw, now)
                     self.gaze = clamp_to_monitors(g[0], g[1], monitors)
                     self.gaze_live = clamp_to_monitors(live[0], live[1], monitors)
@@ -783,7 +811,7 @@ class Engine:
                              active_bounds[1] - margin <= ly < active_bounds[1] + active_bounds[3] + margin)
                 if not in_active or mon != current or (wid and wid != aw):
                     active_until = now + CALM_S
-                self.status = f"Looking at monitor {mon + 1}"
+                self.status = f"Looking at monitor {mon + 1}" + self.seat_note()
                 if busy:
                     cand = None
                     continue

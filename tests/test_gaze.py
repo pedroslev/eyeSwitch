@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from gaze import FixationFilter, GazeModel, OneEuro, Smoother, fit  # noqa: E402
+from gaze import FixationFilter, GazeModel, OneEuro, SeatCompensation, Smoother, fit  # noqa: E402
 
 GRID = [(fx, fy) for fy in (0.08, 0.5, 0.92) for fx in (0.08, 0.5, 0.92)]
 SCREEN = (3840, 1080)
@@ -192,6 +192,56 @@ class OneEuroTest(unittest.TestCase):
         f.update((10, 10), 0.0)
         self.assertIsNone(f.update(None, 0.1))
         self.assertEqual(f.update((900, 400), 5.0), (900.0, 400.0))
+
+
+def vec(tx=0.0, ty=0.0, tz=-40.0):
+    return np.array([0, 0, tx, ty, tz, 0, 0, 0, 0], float)
+
+
+class SeatCompensationTest(unittest.TestCase):
+    def setUp(self):
+        self.seat = SeatCompensation(ref=[0, 0, -40], px_per_cm=30, eye_px=[1000, 500])
+
+    def test_nothing_changes_where_you_calibrated(self):
+        self.assertEqual(self.seat.apply((1500, 700), vec()), (1500, 700))
+
+    def test_sitting_further_to_your_right_moves_the_point_right(self):
+        # the camera sees you on the left of its picture (x decreases) when you move to your right
+        x, y = self.seat.apply((1500, 700), vec(tx=-2))
+        self.assertAlmostEqual(x, 1560)
+        self.assertAlmostEqual(y, 700)
+
+    def test_sitting_higher_moves_the_point_up_the_screen(self):
+        x, y = self.seat.apply((1500, 700), vec(ty=1))
+        self.assertAlmostEqual(y, 670)                       # smaller y is higher on the desktop
+
+    def test_sitting_further_back_scales_the_point_away_from_the_eye(self):
+        x, y = self.seat.apply((1500, 700), vec(tz=-48))     # 20% farther
+        self.assertAlmostEqual(x, 1000 + 1.2 * 500)
+        self.assertAlmostEqual(y, 500 + 1.2 * 200)
+
+    def test_an_absurd_distance_is_limited(self):
+        x, _ = self.seat.apply((1500, 700), vec(tz=-400))
+        self.assertAlmostEqual(x, 1000 + 1.6 * 500)
+
+    def test_the_offset_is_in_cm_as_the_user_sees_it(self):
+        right, up, farther = self.seat.offset_cm(vec(tx=-2, ty=1, tz=-45))
+        self.assertEqual((right, up, farther), (2, -1, 5))
+
+    def test_it_is_made_from_the_calibration_rows_and_survives_the_model_roundtrip(self):
+        model = fit(*synthetic(10)[:3])
+        rows = np.tile(vec(tx=-1.5, ty=1.5, tz=-42.5)[:len(model.mean)], (20, 1))
+        model.seat = SeatCompensation.make(model, rows, 32.0)
+        self.assertEqual(model.seat.ref, [-1.5, 1.5, -42.5])
+        again = GazeModel.from_dict(model.to_dict())
+        self.assertEqual(again.seat.ref, model.seat.ref)
+        self.assertEqual(again.seat.eye_px, model.seat.eye_px)
+
+    def test_a_calibration_saved_before_this_has_no_seat(self):
+        model = fit(*synthetic(10)[:3])
+        d = model.to_dict()
+        del d["seat"]
+        self.assertIsNone(GazeModel.from_dict(d).seat)
 
 
 if __name__ == "__main__":

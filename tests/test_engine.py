@@ -14,7 +14,7 @@ import backends  # noqa: E402
 import engine as engine_mod  # noqa: E402
 import virtualcam  # noqa: E402
 from backends.base import BaseSession, Monitor  # noqa: E402
-from gaze import GazeModel  # noqa: E402
+from gaze import GazeModel, SeatCompensation  # noqa: E402
 from gestures import GestureModel  # noqa: E402
 from tracker import Face  # noqa: E402
 
@@ -491,6 +491,34 @@ class EngineTest(unittest.TestCase):
         FakeTracker.face = looking_at(2900, 400)                           # looking at an app in the overview
         self.assertTrue(self.wait_for(
             lambda: any(abs(x - 2900) < 150 and abs(y - 400) < 150 for x, y in self.os.warps), 4))
+
+    # --- seat position: the gaze follows where the head is, not only where it points ---------
+    def seated(self, comp=True):
+        e = self.start("window", seat_compensation=comp)
+        e.gaze_model.seat = SeatCompensation([0, 0, -40], 30, [1000, 500])
+        return e
+
+    def test_the_estimate_is_corrected_for_a_head_that_moved(self):
+        e = self.seated()
+        FakeTracker.face = Face(0, 0, -2, 0, -40, 1000, 500, 0, 0)         # 2 cm to the user's right
+        self.assertTrue(self.wait_for(lambda: e.gaze is not None and abs(e.gaze[0] - 1060) < 5))
+        self.assertAlmostEqual(e.gaze[1], 500, delta=5)
+
+    def test_the_correction_can_be_turned_off(self):
+        e = self.seated(comp=False)
+        FakeTracker.face = Face(0, 0, -2, 0, -40, 1000, 500, 0, 0)
+        self.assertTrue(self.wait_for(lambda: e.gaze is not None and abs(e.gaze[0] - 1000) < 5))
+        time.sleep(0.3)
+        self.assertAlmostEqual(e.gaze[0], 1000, delta=5)
+
+    def test_it_says_so_when_the_seat_is_far_from_where_it_calibrated(self):
+        e = self.seated()
+        FakeTracker.face = Face(0, 0, -3, 1, -48, 1000, 500, 0, 0)         # 3 cm right, 1 up, 8 cm farther
+        self.assertTrue(self.wait_for(lambda: "seat moved" in e.status))
+        self.assertIn("8 cm farther", e.status)
+        self.assertIn("compensating", e.status)
+        FakeTracker.face = Face(0, 0, 0, 0, -40, 1000, 500, 0, 0)
+        self.assertTrue(self.wait_for(lambda: "seat moved" not in e.status and e.status.startswith("Looking")))
 
     # --- the click by looking only happens inside the all-apps view ----------
     def test_opening_the_overview_by_any_means_starts_the_session_and_closing_it_ends_it(self):

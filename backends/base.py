@@ -78,6 +78,10 @@ class BaseSession:
         the last call. Super with another key (Super+Tab...) is not a tap. False where it cannot be watched."""
         return False
 
+    def pixels_per_cm(self):
+        """Pixel density of the screens, from their reported physical size; None when unknown."""
+        return None
+
     def overview_open(self):
         """Is the system's all-apps view (GNOME's overview, macOS Mission Control) open right now?
         True / False, or None when this backend cannot tell."""

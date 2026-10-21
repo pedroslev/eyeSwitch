@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import shutil
 import statistics
 import subprocess
 import sys
@@ -227,18 +228,21 @@ class FullCalibration(CalibrationBase):
 
     def __init__(self, engine, on_done):
         super().__init__(engine, on_done)
-        rng = random.Random()
-        self.steps = []                              # (monitor, fx, fy, kind)
-        for mon in range(len(self.monitors)):
-            grid = [(fx, fy) for fy in GRID_Y for fx in GRID_X]
-            rng.shuffle(grid)
-            self.steps += [(mon, fx, fy, "grid") for fx, fy in grid]
-            self.steps += [(mon, fx, fy, "check") for fx, fy in self.CHECKS]
+        self.steps = self._plan(random.Random())     # (monitor, fx, fy, kind)
         self.samples, self.raw, self.i, self.win_mon = [], [], 0, None
         self.retries, self.dropped_blink, self.dropped_move = {}, 0, 0
         self.t0 = time.monotonic()
         engine.want_shapes = True                    # blink scores need the face blendshapes
         self._next()
+
+    def _plan(self, rng):
+        steps = []
+        for mon in range(len(self.monitors)):
+            grid = [(fx, fy) for fy in GRID_Y for fx in GRID_X]
+            rng.shuffle(grid)
+            steps += [(mon, fx, fy, "grid") for fx, fy in grid]
+            steps += [(mon, fx, fy, "check") for fx, fy in self.CHECKS]
+        return steps
 
     def _finish(self, ok, message):
         self.engine.want_shapes = False
@@ -340,7 +344,9 @@ class FullCalibration(CalibrationBase):
             feats, targets, _ = self._rows([k])
             guess = np.median([held_out.predict(f) for f in feats], axis=0)
             check_errors.append(float(np.hypot(*(guess - targets[0]))))
-        model = gaze.fit(*self._rows(grid + check), column_sets=GAZE_COLUMN_SETS)
+        every = self._rows(grid + check)
+        model = gaze.fit(*every, column_sets=GAZE_COLUMN_SETS)
+        model.seat = gaze.SeatCompensation.make(model, every[0], getattr(self.engine, "px_per_cm", 36.0))
         self.engine.set_calibration(yaws, self.monitors, model, getattr(self.engine, "active_height", None))
 
         width = statistics.mean(m.w for m in self.monitors)
@@ -366,6 +372,7 @@ class FullCalibration(CalibrationBase):
                            "noise_px": model.noise_px, "check_mean_px": mean_check,
                            "check_worst_px": worst_check, "dropped_blink_frames": self.dropped_blink,
                            "dropped_moving_frames": self.dropped_move, "points": report}, f, indent=2)
+            archive_calibration()
         except OSError:
             pass
 
@@ -383,6 +390,70 @@ class FullCalibration(CalibrationBase):
                         "still and follow each dot with your head and eyes, then calibrate again. The camera "
                         "preview shows whether your face and irises are being detected.")
         self._finish(True, message)
+
+
+HISTORY_KEEP = 10
+CALIBRATION_FILES = ("calibration.json", "calibration_raw.npz", "calibration_samples.npz", "calibration_report.json")
+
+
+def archive_calibration():
+    """Keep a dated copy of this calibration's files (numbers only), the newest HISTORY_KEEP: a calibration used to
+    overwrite the previous one, so how a calibration holds up from one sitting to the next could not be studied."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    folder = os.path.join(CONFIG_DIR, "history", stamp)
+    os.makedirs(folder, exist_ok=True)
+    for name in CALIBRATION_FILES:
+        src = os.path.join(CONFIG_DIR, name)
+        if os.path.exists(src):
+            shutil.copy2(src, folder)
+    old = sorted(os.listdir(os.path.join(CONFIG_DIR, "history")))
+    for name in old[:-HISTORY_KEEP]:
+        shutil.rmtree(os.path.join(CONFIG_DIR, "history", name), ignore_errors=True)
+
+
+class AccuracyCheck(FullCalibration):
+    """Six dots per monitor the calibration has never seen, to measure how exact the gaze is right now, from
+    where you are sitting, with and without the seat-position correction. Changes nothing; each run is logged
+    (numbers only) in accuracy_checks.jsonl so a drift between sittings can be studied."""
+
+    CHECKS = ((0.17, 0.30), (0.50, 0.70), (0.83, 0.30), (0.50, 0.30))
+
+    def _plan(self, rng):
+        return [(mon, fx, fy, "check") for mon in range(len(self.monitors)) for fx, fy in self.CHECKS]
+
+    def _solve(self):
+        model = self.engine.gaze_model
+        if model is None:
+            return self._finish(False, "Calibrate first.")
+        plain, fixed, offsets = [], [], []
+        for k in range(len(self.steps)):
+            feats, targets, _ = self._rows([k])
+            raw = [model.predict(f) for f in feats]
+            comp = [model.seat.apply(r, f) for r, f in zip(raw, feats)] if model.seat else raw
+            plain.append(float(np.hypot(*(np.median(raw, axis=0) - targets[0]))))
+            fixed.append(float(np.hypot(*(np.median(comp, axis=0) - targets[0]))))
+            if model.seat:
+                offsets.append(model.seat.offset_cm(np.median(feats, axis=0)))
+        offset = np.mean(offsets, axis=0).tolist() if offsets else None
+        record = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "dots": len(plain), "mean_plain_px": statistics.mean(plain),
+                  "mean_compensated_px": statistics.mean(fixed), "worst_plain_px": max(plain),
+                  "worst_compensated_px": max(fixed), "seat_offset_cm": offset, "resolution": self.engine.active_height}
+        try:
+            with open(os.path.join(CONFIG_DIR, "accuracy_checks.jsonl"), "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError:
+            pass
+        text = (f"Accuracy now, on {len(plain)} dots: average error {record['mean_compensated_px']:.0f} px "
+                f"(worst {record['worst_compensated_px']:.0f}) with the seat correction")
+        if model.seat:
+            text += f", {record['mean_plain_px']:.0f} px (worst {record['worst_plain_px']:.0f}) without it"
+            if offset:
+                text += (f".\nYou are {offset[0]:+.0f} cm right, {offset[1]:+.0f} cm up and {offset[2]:+.0f} cm farther "
+                         "than when you calibrated")
+            text += "."
+        else:
+            text += ".\nThis calibration predates the seat correction: calibrate once to enable it."
+        self._finish(True, text)
 
 
 MAX_DOT_SPEED = 4000.0       # px/s: a long jump is drawn as a run across the screen, not a tug
@@ -983,6 +1054,12 @@ class MainWindow(QWidget):
                                  "gesture, and at 10 per second after 1.5 s of calm, which takes about two "
                                  "thirds off the CPU. Untick it for the fastest possible first reaction.")
         self.adaptive.toggled.connect(lambda on: self._set("adaptive_rate", on))
+        self.seat = QCheckBox("Correct for where I sit (seat position)")
+        self.seat.setChecked(cfg.get("seat_compensation", True))
+        self.seat.setToolTip("When you come back to a different spot (a rolling chair, a shifted camera) the gaze "
+                             "point is moved to follow your head's position, using geometry. Needs a calibration "
+                             "made with this version. \"Check accuracy\" measures it with and without.")
+        self.seat.toggled.connect(lambda on: self._set("seat_compensation", on))
         self.stability = self._spin(QSpinBox(), 1, 5, 1, "", cfg["stability"], "stability")
         self.stability.setToolTip("How steady the gaze point is: higher holds it still more firmly and "
                                   "follows you a little later. Raise it if focus jumps around.")
@@ -1019,6 +1096,10 @@ class MainWindow(QWidget):
         self.quick_btn.clicked.connect(lambda: self._calibrate(QuickCalibration))
         self.full_btn = QPushButton("Full calibration (monitors and windows)")
         self.full_btn.clicked.connect(lambda: self._calibrate(FullCalibration))
+        self.check_btn = QPushButton("Check accuracy now")
+        self.check_btn.setToolTip("Eight dots the calibration never saw, to measure how exact the gaze is from where you "
+                                  "are sitting now. Changes nothing.")
+        self.check_btn.clicked.connect(lambda: self._calibrate(AccuracyCheck))
         self.note = QLabel()
         self.note.setWordWrap(True)
         self.note.setEnabled(False)
@@ -1041,6 +1122,7 @@ class MainWindow(QWidget):
             layout.addWidget(w)
         layout.addLayout(self.form)
         layout.addWidget(self.adaptive)
+        layout.addWidget(self.seat)
         layout.addWidget(self.show_gaze)
         layout.addWidget(self.vcam)
         layout.addWidget(self.vcam_note)
@@ -1056,6 +1138,7 @@ class MainWindow(QWidget):
         buttons.addWidget(self.quick_btn)
         buttons.addWidget(self.full_btn)
         layout.addLayout(buttons)
+        layout.addWidget(self.check_btn)
         layout.addWidget(self.note)
         warning = backends.unsupported_reason() or ("" if tray else
                                                     "No system tray available: closing this window quits the app.")
@@ -1186,12 +1269,14 @@ class MainWindow(QWidget):
             return self._message("Only one monitor detected.", QMessageBox.Warning)
         self.quick_btn.setEnabled(False)
         self.full_btn.setEnabled(False)
+        self.check_btn.setEnabled(False)
         self.calibration = kind(self.engine, self._calibration_done)
 
     def _calibration_done(self, ok, message):
         self.calibration = None
         self.quick_btn.setEnabled(True)
         self.full_btn.setEnabled(True)
+        self.check_btn.setEnabled(True)
         self.show_window()
         self._message(message, QMessageBox.Information if ok else QMessageBox.Warning)
 

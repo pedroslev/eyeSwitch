@@ -201,6 +201,23 @@ and look at it for a moment (or use a click gesture). No gesture is needed. It i
 extension, which only observes the keyboard (nothing is grabbed or delayed), so it is Linux (X11) only for now;
 turn it off with *Also when I press Super on the keyboard* in Gestures.
 
+**Sitting somewhere else than where you calibrated.** A calibration is for one seat position: roll the chair a few
+centimetres and the same glance lands somewhere else. On real data the head moved only ~0.5 cm during a
+calibration, and that movement was tangled up with where you looked (correlation -0.64 with the target), so the
+position cannot be learned from it (it was tried: the coefficients exploded). A full geometric model (a ray from
+the eye to the screen plane, 13 parameters) was also tried on the same data and was worse (371 px against 162 px),
+because one seat position cannot pin down so many numbers. What is used instead is a **first-order geometric
+correction on top of the model**, with the head position the tracker already measures (in cm): if the eye moves,
+the point it aims at moves with it, and if it moves away from the screen the point moves out from the eye's own
+projection on the screen, in proportion to the distance. Only the pixel density is a guess (read from the
+monitors' reported size). It is on by default (*Correct for where I sit*), it is saved with each calibration (older
+ones get it from their own saved rows), and the status says so when you are more than 5 cm from where you
+calibrated. **How much it helps has not been measured yet**: *Check accuracy now* shows eight dots the
+calibration never saw, reports the error with and without the correction and how far you are from the calibration
+position, and logs it (numbers only) in `~/.config/eyeswitch/accuracy_checks.jsonl`. Each calibration also keeps a dated
+copy of its files in `~/.config/eyeswitch/history/` (the last 10). Run the check at your usual seat and again after
+getting up and sitting back down, and compare the two numbers.
+
 **Train the hand.** The ready-made recognizer reads other people's hands and may misjudge yours, a palm seen
 from the side, or a camera angle that is not frontal. *Train hand...* in Gestures records about 15 seconds of
 your own open palm, fist and resting hand and learns to tell them apart (the way face gestures are trained,

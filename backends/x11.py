@@ -113,6 +113,13 @@ class Session(BaseSession):
     def window_bounds(self, wid):
         return self._bounds(wid)
 
+    def pixels_per_cm(self):
+        try:
+            ms = [m for m in self.root.xrandr_get_monitors().monitors if m.width_in_millimeters > 0]
+            return sum(m.width_in_pixels for m in ms) / (sum(m.width_in_millimeters for m in ms) / 10.0) if ms else None
+        except Exception:
+            return None
+
     MAX_TAP_S = 2.0
     _SHELL = ["--session", "--dest", "org.gnome.Shell", "--object-path", "/org/gnome/Shell"]
 
