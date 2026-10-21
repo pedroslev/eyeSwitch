@@ -55,7 +55,9 @@ from engine import (CONFIG_DIR, GAZE_COLUMN_SETS, Engine, load_config, nearest_m
                     save_config)
 from tracker import Face, list_cameras  # noqa: E402
 
-MODES = [("Monitor only (head direction)", "monitor"), ("Monitor and window (gaze)", "window")]
+MODES = [("Monitor only (head direction)", "monitor"),
+         ("Monitor + overview (choose the app with your eyes after Super)", "overview"),
+         ("Monitor and window (gaze)", "window")]
 GRID_X = (0.06, 0.28, 0.5, 0.72, 0.94)  # dot positions of the full calibration, as screen fractions
 GRID_Y = (0.08, 0.5, 0.92)
 
@@ -1207,8 +1209,12 @@ class MainWindow(QWidget):
         elif self.engine.resolution_mismatch:
             text = (f"The gaze calibration was made at {self.engine.calib_height}p and the camera now runs at "
                     f"{self.engine.active_height}p: run the full calibration again (or change the resolution).")
-        elif self.cfg["mode"] == "window" and self.engine.gaze_model is None:
-            text = "Window mode needs the full calibration. Until then it works like monitor-only mode."
+        elif self.cfg["mode"] in ("window", "overview") and self.engine.gaze_model is None:
+            text = "This mode needs the full calibration. Until then it works like monitor-only mode."
+        elif self.cfg["mode"] == "overview":
+            text = ("Monitor + overview: the focus follows your head between monitors. Press Super and look at an "
+                    "app: the pointer follows your eyes there and clicks after a moment (settings in Gestures). "
+                    "Nothing is clicked anywhere else.")
         elif self.cfg["mode"] == "window":
             text = ("Window mode: look at a window and it gets focus. Redo the full calibration when "
                     "you move the camera or change your seat.")

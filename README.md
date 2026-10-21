@@ -52,6 +52,7 @@ this folder or change Python environments. To run without installing: `python ey
 | Mode | What it does | Calibration |
 |------|--------------|-------------|
 | **Monitor only** (default) | Focus follows the monitor your head is turned to. | *Quick*: look at one dot per monitor, ~5 s each. |
+| **Monitor + overview** | Like monitor only, and when you press Super (the all-apps view opens) your eyes choose the app: the pointer follows your gaze there and clicks after a moment. Nothing happens outside the overview. | *Full*, same as window mode. |
 | **Monitor and window** | Focus follows the window you are looking at, on any monitor. | *Full*: follow a dot over a 5x3 grid on each monitor, ~1 min total. |
 
 3. Keep it running. Closing the window hides it to the tray; Quit is in the tray menu.

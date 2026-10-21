@@ -520,6 +520,38 @@ class EngineTest(unittest.TestCase):
         FakeTracker.face = Face(0, 0, 0, 0, -40, 1000, 500, 0, 0)
         self.assertTrue(self.wait_for(lambda: "seat moved" not in e.status and e.status.startswith("Looking")))
 
+    # --- the "overview" mode: monitor focus, plus the gaze inside the all-apps view ----------
+    def quiet_mode(self, mode, **g):
+        e = self.gestures(mode, binding(), gcfg={"pause_s": 3.0, "dwell_ms": 0, **g})
+        FakeTracker.face = looking_at(1000, 500)
+        FakeTracker.shapes = {"browInnerUp": 0.0, "jawOpen": 0.0}
+        time.sleep(0.4)
+        return e
+
+    def test_monitor_only_never_starts_an_overview_session(self):
+        e = self.quiet_mode("monitor")
+        self.os.overview = True
+        time.sleep(0.8)
+        self.assertFalse(e.in_session)
+        self.assertEqual(self.os.warps, [])
+
+    def test_the_overview_mode_follows_the_gaze_in_the_overview_and_clicks_there_only(self):
+        e = self.quiet_mode("overview", dwell_ms=300)
+        FakeTracker.face = looking_at(2900, 400)
+        time.sleep(1.2)
+        self.assertEqual(self.os.clicks, 0)                                # overview closed: looking is nothing
+        self.assertEqual(self.os.warps, [])
+        self.os.overview = True
+        self.assertTrue(self.wait_for(lambda: self.os.clicks == 1, 5))
+        self.assertTrue(any(abs(x - 2900) < 150 for x, _ in self.os.warps))
+
+    def test_the_overview_mode_does_not_choose_windows_by_gaze(self):
+        e = self.quiet_mode("overview")
+        self.os.active = A
+        FakeTracker.face = looking_at(1400, 500)                           # looking at window B, same monitor
+        time.sleep(1.5)
+        self.assertEqual(self.os.activated, [])
+
     # --- the click by looking only happens inside the all-apps view ----------
     def test_opening_the_overview_by_any_means_starts_the_session_and_closing_it_ends_it(self):
         e = self.ready_for_super()

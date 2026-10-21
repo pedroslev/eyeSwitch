@@ -26,7 +26,8 @@ DEFAULTS = {
     "camera": 0,
     "delay_ms": 300,            # facing another monitor this long switches to it
     "enabled": True,
-    "mode": "monitor",          # "monitor": head direction only; "window": gaze, needs full calibration
+    "mode": "monitor",          # "monitor": head direction only; "overview": the same, plus choosing an app with the
+                                # gaze inside the all-apps view (Super); "window": gaze on windows. Both need the full calibration
     "window_delay_ms": 500,     # looking at another window of the same monitor this long focuses it
     "typing_wait_s": 2.0,       # window mode: no same-monitor window changes this soon after typing
     "show_gaze": False,         # draw the estimated gaze point (for testing)
@@ -184,7 +185,7 @@ class Camera:
     def _wanted(self):
         cfg = self.engine.cfg
         return (cfg["camera"], bool(cfg["virtual_camera"]) and virtualcam.AVAILABLE,
-                self.engine.want_shapes or bool(self.engine.active_gestures()) or cfg["mode"] == "window",
+                self.engine.want_shapes or bool(self.engine.active_gestures()) or cfg["mode"] in ("window", "overview"),
                 cfg["camera_height"], cfg["tracking_fps"], bool(cfg["gestures"].get("hand_toggle", False)) or self.engine.hand_wanted > 0)
 
     def _watch(self, cam):
@@ -458,7 +459,7 @@ class Engine:
         """After a key gesture (Super: the overview), let the pointer follow the gaze for a while: the system
         draws the pointer above everything and highlights what is under it, so it works where no overlay can."""
         if (self.cfg["gestures"].get("gaze_cursor", True) and self.gaze_model is not None and self.calibrated
-                and not self.resolution_mismatch):
+                and not self.resolution_mismatch and self.cfg["mode"] in ("window", "overview")):
             self.session_start = time.monotonic()
             self.session_until = self.session_start + seconds
             self.in_session = True
