@@ -1098,7 +1098,11 @@ def build_tray(window, engine, cfg, app):
 
     def sync():
         on = cfg["enabled"] and not engine.suspended
-        tray.setIcon(icon("eyeswitch-tray.svg" if on else "eyeswitch-tray-paused.svg"))
+        state = ("on" if on else "suspended") if cfg["enabled"] else "off"
+        tray.setIcon(icon({"on": "eyeswitch-tray.svg", "suspended": "eyeswitch-tray-suspended.svg",
+                           "off": "eyeswitch-tray-paused.svg"}[state]))
+        tray.setToolTip({"on": "eyeSwitch: ON", "off": "eyeSwitch: OFF (camera released)",
+                         "suspended": "eyeSwitch: SUSPENDED (watching, acting on nothing; repeat the gesture to resume)"}[state])
         active.blockSignals(True)
         active.setChecked(on)
         active.blockSignals(False)
