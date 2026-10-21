@@ -1,13 +1,14 @@
 """Face feature geometry on synthetic landmarks. Run: python -m unittest discover tests"""
 import os
 import sys
+import time
 import unittest
 from types import SimpleNamespace
 
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from tracker import LEFT_EYE, NOSE_TIP, RIGHT_EYE, _face  # noqa: E402
+from tracker import HAND_MODEL_PATH, LEFT_EYE, NOSE_TIP, RIGHT_EYE, HandProcess, _face  # noqa: E402
 
 W, H = 640, 480
 
@@ -73,6 +74,35 @@ class FaceTest(unittest.TestCase):
     def test_yaw_and_scale(self):
         self.assertAlmostEqual(_face(matrix(25), landmarks(), W, H).yaw, 25, places=3)
         self.assertAlmostEqual(_face(matrix(-10), landmarks(), W, H).yaw, -10, places=3)
+
+
+@unittest.skipUnless(os.path.exists(HAND_MODEL_PATH), "needs the hand model downloaded")
+class HandProcessTest(unittest.TestCase):
+    """The recognizer lives in its own process: a crash there must not take the app down."""
+
+    def ask(self, hand, frames=40):
+        verdicts = []
+        for i in range(frames):
+            v = hand.poll()
+            if v is not HandProcess.NOTHING_NEW:
+                verdicts.append(v)
+            if not hand.busy:
+                hand.submit(np.zeros((90, 160, 3), np.uint8), i * 100)
+            time.sleep(0.05)
+        return verdicts
+
+    def test_answers_and_survives_being_killed(self):
+        hand = HandProcess(HAND_MODEL_PATH)
+        try:
+            self.assertGreater(len(self.ask(hand)), 3)
+            hand.proc.kill()
+            time.sleep(0.3)
+            self.ask(hand, 20)
+            self.assertEqual(hand.restarts, 1)
+            self.assertTrue(hand.alive)
+            self.assertGreater(len(self.ask(hand)), 3)
+        finally:
+            hand.close()
 
 
 if __name__ == "__main__":

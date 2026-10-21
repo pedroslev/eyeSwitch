@@ -1,7 +1,10 @@
 """Webcam head-yaw tracking with MediaPipe Face Landmarker."""
 import math
 import os
+import queue
+import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from collections import namedtuple
@@ -9,6 +12,7 @@ from collections import namedtuple
 import cv2
 import numpy as np
 
+from handworker import HEADER
 from virtualcam import LABEL as VIRTUAL_LABEL
 
 # OpenCV spreads even a colour conversion over every core: the same 0.2 ms of wall time cost 13x more CPU
@@ -90,6 +94,73 @@ def ensure_model(path=MODEL_PATH, url=MODEL_URL):
 SIZES = ((1920, 1080), (1280, 720), (640, 480))
 
 
+class HandProcess:
+    """Client of handworker.py: one request in flight, answers read without blocking."""
+    NOTHING_NEW = object()
+    MAX_RESTARTS = 3
+
+    def __init__(self, model_path):
+        self.model_path, self.restarts = model_path, 0
+        self.proc = self.reader = None
+        self.busy, self.alive, self._answer = False, True, queue.Queue()
+        self._start()
+
+    def _start(self):
+        self.proc = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "handworker.py"),
+                                      self.model_path],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.busy, self._answer = False, queue.Queue()
+        threading.Thread(target=self._read_answers, args=(self.proc, self._answer), daemon=True).start()
+
+    @staticmethod
+    def _read_answers(proc, out):
+        for line in proc.stdout:
+            out.put(line.decode().strip())
+        out.put(None)                                       # the process ended
+
+    def submit(self, rgb, ts_ms):
+        try:
+            self.proc.stdin.write(HEADER.pack(rgb.shape[1], rgb.shape[0], ts_ms) + rgb.tobytes())
+            self.proc.stdin.flush()
+            self.busy = True
+        except (BrokenPipeError, OSError):
+            self._died()
+
+    def poll(self):
+        """The newest verdict ((name, score) or None) if an answer came, else NOTHING_NEW."""
+        verdict = self.NOTHING_NEW
+        while True:
+            try:
+                line = self._answer.get_nowait()
+            except queue.Empty:
+                return verdict
+            if line is None:
+                self._died()
+                return self.NOTHING_NEW
+            if line == "ready":
+                continue
+            self.busy = False
+            name, _, score = line.partition(" ")
+            verdict = None if name == "-" else (name, float(score))
+
+    def _died(self):
+        """A crash of the recognizer costs only the hand signal: try again a few times, then give up."""
+        self.busy = False
+        if self.restarts < self.MAX_RESTARTS:
+            self.restarts += 1
+            print("hand recognizer stopped; restarting it", file=sys.stderr)
+            self._start()
+        else:
+            self.alive = False
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=2)
+        except Exception:
+            self.proc.kill()
+
+
 class HeadTracker:
     def __init__(self, camera=0, sink=None, blendshapes=False, height="auto", fps=30, hands=False):
         """Opens the camera at the best resolution it really delivers (`height` "auto"), or at 1080/720
@@ -122,9 +193,7 @@ class HeadTracker:
         self.face_enabled, self.hand, self.recognizer, self._last_hand, self._hand_seen = True, None, None, 0.0, -1e9
         if hands:
             ensure_model(HAND_MODEL_PATH, HAND_MODEL_URL)
-            self.recognizer = vision.GestureRecognizer.create_from_options(vision.GestureRecognizerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=HAND_MODEL_PATH),
-                running_mode=vision.RunningMode.VIDEO, num_hands=1))
+            self.recognizer = HandProcess(HAND_MODEL_PATH)
         self.max_fps = self.fps = fps
         self.min_interval = 0.8 / fps                # 0.8: do not skip frames to timing jitter
         self.camera_fps, self._grabbed = 30.0, None     # what the camera really delivers, measured
@@ -150,17 +219,19 @@ class HeadTracker:
         self.face_enabled = on
 
     def _read_hand(self, frame, now):
-        """The hand's gesture name and score (Open_Palm, Closed_Fist...), or None when no hand is seen."""
-        self._last_hand = now
-        width = min(HAND_WIDTH, frame.shape[1])
-        small = cv2.resize(frame, (width, int(frame.shape[0] * width / frame.shape[1])), interpolation=cv2.INTER_AREA)
-        mp = self._mp
-        img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
-        res = self.recognizer.recognize_for_video(img, int((now - self._t0) * 1000))
-        top = res.gestures[0][0] if res.gestures else None
-        self.hand = (top.category_name, top.score) if top else None
-        if self.hand and self.hand[0] in SIGNAL_POSES and self.hand[1] >= 0.5:
-            self._hand_seen = now
+        """Hand the frame to the recognizer process (when it is free) and pick up its latest answer."""
+        verdict = self.recognizer.poll()
+        if verdict is not HandProcess.NOTHING_NEW:
+            self.hand = verdict
+            if self.hand and self.hand[0] in SIGNAL_POSES and self.hand[1] >= 0.5:
+                self._hand_seen = now
+        if not self.recognizer.busy:
+            self._last_hand = now
+            width = min(HAND_WIDTH, frame.shape[1])
+            small = cv2.resize(frame, (width, int(frame.shape[0] * width / frame.shape[1])), interpolation=cv2.INTER_AREA)
+            self.recognizer.submit(cv2.cvtColor(small, cv2.COLOR_BGR2RGB), int((now - self._t0) * 1000))
+        if not self.recognizer.alive:
+            self.hand = None
 
     @property
     def hand_recent(self):
@@ -194,8 +265,8 @@ class HeadTracker:
             if due:
                 break
         self._last = now
-        if self.recognizer is not None and now - self._last_hand >= (
-                HAND_INTERVAL_NEAR if now - self._hand_seen < HAND_NEAR_S else HAND_INTERVAL_IDLE):
+        if self.recognizer is not None and (self.recognizer.busy or now - self._last_hand >= (
+                HAND_INTERVAL_NEAR if now - self._hand_seen < HAND_NEAR_S else HAND_INTERVAL_IDLE)):
             self._read_hand(frame, now)
         if not self.face_enabled:
             self.shapes = self.landmarks = self.blink = None
@@ -226,6 +297,8 @@ class HeadTracker:
     def close(self):
         self.cap.release()
         self.landmarker.close()
+        if self.recognizer is not None:
+            self.recognizer.close()
         if self.recognizer is not None:
             self.recognizer.close()
 
