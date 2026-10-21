@@ -425,19 +425,31 @@ class AccuracyCheck(FullCalibration):
         model = self.engine.gaze_model
         if model is None:
             return self._finish(False, "Calibrate first.")
-        plain, fixed, offsets = [], [], []
+        GAINS = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+        plain, fixed, offsets, dots = [], [], [], []
+        by_gain = {g: [] for g in GAINS}
         for k in range(len(self.steps)):
             feats, targets, _ = self._rows([k])
-            raw = [model.predict(f) for f in feats]
-            comp = [model.seat.apply(r, f) for r, f in zip(raw, feats)] if model.seat else raw
-            plain.append(float(np.hypot(*(np.median(raw, axis=0) - targets[0]))))
-            fixed.append(float(np.hypot(*(np.median(comp, axis=0) - targets[0]))))
+            raw = np.median([model.predict(f) for f in feats], axis=0)
+            comp = (np.median([model.seat.apply(model.predict(f), f) for f in feats], axis=0) if model.seat else raw)
+            plain.append(float(np.hypot(*(raw - targets[0]))))
+            fixed.append(float(np.hypot(*(comp - targets[0]))))
             if model.seat:
                 offsets.append(model.seat.offset_cm(np.median(feats, axis=0)))
+                for g in GAINS:                    # the same dots, with more or less of the shift applied
+                    seat = model.seat.with_gain(g)
+                    by_gain[g].append(float(np.hypot(*(np.median([seat.apply(model.predict(f), f) for f in feats],
+                                                                 axis=0) - targets[0]))))
+            dots.append({"target": targets[0].tolist(), "plain": raw.tolist(), "compensated": comp.tolist(),
+                         "features": np.median(feats, axis=0).tolist()})
         offset = np.mean(offsets, axis=0).tolist() if offsets else None
+        best_gain = min(GAINS, key=lambda g: statistics.mean(by_gain[g])) if model.seat else None
         record = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "dots": len(plain), "mean_plain_px": statistics.mean(plain),
                   "mean_compensated_px": statistics.mean(fixed), "worst_plain_px": max(plain),
-                  "worst_compensated_px": max(fixed), "seat_offset_cm": offset, "resolution": self.engine.active_height}
+                  "worst_compensated_px": max(fixed), "seat_offset_cm": offset, "resolution": self.engine.active_height,
+                  "px_per_cm": model.seat.px_per_cm if model.seat else None, "gain_used": model.seat.gain if model.seat else None,
+                  "mean_error_by_gain": {str(g): statistics.mean(v) for g, v in by_gain.items() if v},
+                  "best_gain": best_gain, "per_dot": dots}
         try:
             with open(os.path.join(CONFIG_DIR, "accuracy_checks.jsonl"), "a") as f:
                 f.write(json.dumps(record) + "\n")
@@ -450,6 +462,9 @@ class AccuracyCheck(FullCalibration):
             if offset:
                 text += (f".\nYou are {offset[0]:+.0f} cm right, {offset[1]:+.0f} cm up and {offset[2]:+.0f} cm farther "
                          "than when you calibrated")
+            if best_gain is not None and offset and max(abs(v) for v in offset) >= 4:
+                text += (f".\nOn these dots the best correction strength would have been x{best_gain:g} "
+                         f"({statistics.mean(by_gain[best_gain]):.0f} px; now x{model.seat.gain:g})")
             text += "."
         else:
             text += ".\nThis calibration predates the seat correction: calibrate once to enable it."

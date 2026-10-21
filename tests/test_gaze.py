@@ -220,6 +220,12 @@ class SeatCompensationTest(unittest.TestCase):
         self.assertAlmostEqual(x, 1000 + 1.2 * 500)
         self.assertAlmostEqual(y, 500 + 1.2 * 200)
 
+    def test_the_strength_scales_the_shift_and_survives_the_roundtrip(self):
+        half = self.seat.with_gain(0.5)
+        self.assertAlmostEqual(half.apply((1500, 700), vec(tx=-2))[0], 1530)
+        self.assertEqual(SeatCompensation.from_dict(half.to_dict()).gain, 0.5)
+        self.assertEqual(SeatCompensation.from_dict({"ref": [0, 0, -40], "px_per_cm": 30, "eye_px": [0, 0]}).gain, 1.0)
+
     def test_an_absurd_distance_is_limited(self):
         x, _ = self.seat.apply((1500, 700), vec(tz=-400))
         self.assertAlmostEqual(x, 1000 + 1.6 * 500)

@@ -99,8 +99,12 @@ class SeatCompensation:
     K_RANGE = (0.6, 1.6)
     MAX_SHIFT_CM = 40.0
 
-    def __init__(self, ref, px_per_cm, eye_px):
+    def __init__(self, ref, px_per_cm, eye_px, gain=1.0):
         self.ref, self.px_per_cm, self.eye_px = [float(v) for v in ref], float(px_per_cm), [float(v) for v in eye_px]
+        self.gain = float(gain)               # how much of the geometric shift is applied (1 = all of it)
+
+    def with_gain(self, gain):
+        return SeatCompensation(self.ref, self.px_per_cm, self.eye_px, gain)
 
     @classmethod
     def make(cls, model, features, px_per_cm):
@@ -122,18 +126,18 @@ class SeatCompensation:
     def apply(self, point, vec):
         v = np.asarray(vec, float)
         lim = self.MAX_SHIFT_CM
-        dx = -float(np.clip(v[TX] - self.ref[0], -lim, lim)) * self.px_per_cm
-        dy = -float(np.clip(v[TY] - self.ref[1], -lim, lim)) * self.px_per_cm
+        dx = -float(np.clip(v[TX] - self.ref[0], -lim, lim)) * self.px_per_cm * self.gain
+        dy = -float(np.clip(v[TY] - self.ref[1], -lim, lim)) * self.px_per_cm * self.gain
         k = float(np.clip(v[TZ] / self.ref[2], *self.K_RANGE)) if self.ref[2] else 1.0
         ex, ey = self.eye_px
         return (ex + dx + k * (point[0] - ex), ey + dy + k * (point[1] - ey))
 
     def to_dict(self):
-        return {"ref": self.ref, "px_per_cm": self.px_per_cm, "eye_px": self.eye_px}
+        return {"ref": self.ref, "px_per_cm": self.px_per_cm, "eye_px": self.eye_px, "gain": self.gain}
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d["ref"], d["px_per_cm"], d["eye_px"])
+        return cls(d["ref"], d["px_per_cm"], d["eye_px"], d.get("gain", 1.0))
 
 
 def _informative(z, groups, cols):
