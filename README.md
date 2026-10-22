@@ -1,6 +1,6 @@
 # eyeSwitch
 
-Cross-platform take on [Glance Switch](https://glanceswitch.com/): the webcam tells which
+Cross-platform, webcam-based focus control: the camera tells which
 monitor your head is facing and keyboard focus (and the pointer) follow you there.
 Runs as a desktop app with a tray icon and a small settings window (Qt).
 
